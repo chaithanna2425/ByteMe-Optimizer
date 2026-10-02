@@ -1,126 +1,178 @@
 """
-ByteMe Manufacturing Energy Scheduler - Version 3
+ByteMe Manufacturing Energy Scheduler - Version 4
+Generic Factory/Process Model + Solar + Tariff Cost Optimization
 
-This module implements a solar-aware production scheduler using Google OR-Tools CP-SAT.
-It generates valid schedules that shift flexible manufacturing operations toward periods
-of higher solar availability and lower electricity tariffs while respecting production
-constraints and deadlines.
+This module implements the GENERIC optimization engine of the ByteMe
+manufacturing energy scheduling system using Google OR-Tools CP-SAT.
 
-Current capabilities:
-- Factory Data → OR-Tools → Valid Production Schedule
-- Baseline scheduling (minimizes makespan)
-- Solar-aware demand shifting for flexible processes
-- Electricity tariff / energy cost optimization (Version 3)
-- Respects planning horizon and production deadline
-- Enforces process dependencies/precedence constraints
-- Calculates solar energy vs grid energy consumption
-- Calculates monetary energy cost from DEMO tariff data
+Architecture (configuration-driven, factory-agnostic):
 
-Future versions may add:
-- Real tariff / weather data integration
-- Advanced demand shifting strategies
+    FACTORY CONFIGURATION (factory_data.py)
+        |
+    GENERIC PROCESS/MACHINE MODEL (models.py)
+        |
+    GENERIC PRODUCTION CONSTRAINTS
+        |
+    OR-TOOLS OPTIMIZATION ENGINE (this module)
+        |
+    ENERGY + SOLAR + TARIFF MODEL (energy_data.py + helpers below)
+        |
+    VALIDATED SCHEDULE + ENERGY/COST METRICS
+
+The engine receives a generic FactoryConfig and NEVER checks for specific
+factory names or process names. Adding a new factory means adding a new
+configuration dict - the algorithm is untouched.
+
+All data used is DEMO/SIMULATED data only (no real prices, weather, or
+forecasting).
+
+Version capabilities preserved:
+- V1: baseline scheduling (minimize makespan)
+- V2: solar-aware demand shifting (maximize ALLOCATED solar under the
+  SHARED hourly solar pool, makespan as tiebreaker)
+- V3: solar + tariff cost optimization (minimize grid electricity cost
+  under the SHARED hourly solar pool, makespan as tiebreaker;
+  non-flexible processes pinned to their baseline start times)
+- V4: all of the above, for ANY factory configuration, with machine/resource
+  no-overlap constraints, optional process time windows, and configuration
+  validation.
 """
 
 from ortools.sat.python import cp_model
-from optimizer.factory_data import DEMO_CHOCOLATE_FACTORY
+
+from optimizer.energy_data import DEMO_SOLAR_PROFILE, DEMO_TARIFF_PROFILE
+from optimizer.models import (
+    SOLAR_SCALE,
+    FactoryConfig,
+    FactoryConfigError,
+    TIME_SCALE,
+    energy_precision_problems,
+    time_to_grid_ceil,
+    time_to_grid_floor,
+)
 
 
-# DEMO Solar Availability Profile
-# Hourly solar power availability in kW (DEMO/SIMULATED values)
-DEMO_SOLAR_PROFILE = {
-    0: 0,    # Midnight
-    1: 0,    # 1 AM
-    2: 0,    # 2 AM
-    3: 0,    # 3 AM
-    4: 0,    # 4 AM
-    5: 0,    # 5 AM
-    6: 5,    # 6 AM - sunrise
-    7: 15,   # 7 AM
-    8: 30,   # 8 AM
-    9: 45,   # 9 AM
-    10: 60,  # 10 AM
-    11: 70,  # 11 AM
-    12: 75,  # 12 PM - peak solar
-    13: 70,  # 1 PM
-    14: 60,  # 2 PM
-    15: 45,  # 3 PM
-    16: 30,  # 4 PM
-    17: 15,  # 5 PM
-    18: 5,   # 6 PM - sunset
-    19: 0,   # 7 PM
-    20: 0,   # 8 PM
-    21: 0,   # 9 PM
-    22: 0,   # 10 PM
-    23: 0,   # 11 PM
-}
+# ---------------------------------------------------------------------------
+# Solver configuration (determinism + optional time limit)
+# ---------------------------------------------------------------------------
 
-
-# DEMO Electricity Tariff Profile
-# Hourly electricity tariff in currency units per kWh (DEMO/SIMULATED values,
-# NOT real electricity prices). Generic structure: hour -> tariff per kWh.
-DEMO_TARIFF_PROFILE = {
-    0: 0.50,  # Midnight
-    1: 0.50,  # 1 AM
-    2: 0.50,  # 2 AM
-    3: 0.50,  # 3 AM
-    4: 0.45,  # 4 AM
-    5: 0.40,  # 5 AM
-    6: 0.30,  # 6 AM
-    7: 0.20,  # 7 AM
-    8: 0.15,  # 8 AM
-    9: 0.10,  # 9 AM
-    10: 0.08,  # 10 AM - cheap midday solar hours
-    11: 0.06,  # 11 AM
-    12: 0.05,  # 12 PM - cheapest (peak solar)
-    13: 0.06,  # 1 PM
-    14: 0.08,  # 2 PM
-    15: 0.10,  # 3 PM
-    16: 0.15,  # 4 PM
-    17: 0.25,  # 5 PM
-    18: 0.40,  # 6 PM - evening ramp
-    19: 0.50,  # 7 PM
-    20: 0.55,  # 8 PM - evening peak
-    21: 0.55,  # 9 PM
-    22: 0.55,  # 10 PM
-    23: 0.50,  # 11 PM
-}
-
-
-def get_tariff(hour):
+class SolverUnknownError(RuntimeError):
     """
-    Get the DEMO electricity tariff for a specific hour.
+    Raised when CP-SAT returns UNKNOWN: the solver hit a limit (e.g. the
+    configured time limit) without finding a solution and without proving
+    infeasibility. Callers must NOT interpret this as INFEASIBLE.
+    """
+    def __init__(self, message, solve_time_seconds=None):
+        super().__init__(message)
+        self.solve_time_seconds = solve_time_seconds
+
+
+class SolverInfeasibleError(RuntimeError):
+    """Internal signal carrying wall time for a proven-infeasible solve."""
+
+    def __init__(self, solve_time_seconds):
+        self.solve_time_seconds = solve_time_seconds
+
+
+
+# Single-worker CP-SAT search is deterministic for a given input, model,
+# and pinned OR-Tools version. Multi-worker search is not: it may return
+# different (equally optimal) solutions between runs.
+DETERMINISTIC_WORKERS = 1
+
+# Default time limit applied by the PUBLIC API layer (seconds per solve).
+# Direct engine callers may pass max_time_seconds explicitly; None means
+# no limit (previous engine behavior).
+DEFAULT_PUBLIC_TIME_LIMIT_SECONDS = 60
+
+
+def _new_solver(max_time_seconds=None):
+    """Create a deterministic, optionally time-limited CP-SAT solver."""
+    solver = cp_model.CpSolver()
+    solver.parameters.num_workers = DETERMINISTIC_WORKERS
+    # Use LP_SEARCH for faster optimality proofs on linear objectives
+    # LP relaxation can provide stronger bounds for proving optimality
+    solver.parameters.search_branching = cp_model.LP_SEARCH
+    # Increase linearization level for better LP relaxation quality
+    solver.parameters.linearization_level = 2
+    if max_time_seconds is not None:
+        solver.parameters.max_time_in_seconds = float(max_time_seconds)
+    return solver
+
+# Re-exported for backward compatibility with code importing these from
+# optimizer.optimizer (they remain DEMO/SIMULATED data).
+__all__ = [
+    "DEMO_SOLAR_PROFILE",
+    "DEMO_TARIFF_PROFILE",
+    "get_solar_availability",
+    "get_tariff",
+    "calculate_solar_energy",
+    "calculate_process_cost",
+    "create_baseline_schedule",
+    "create_solar_aware_schedule",
+    "create_cost_optimized_schedule",
+    "load_factory_config",
+    "print_baseline_schedule",
+    "print_solar_aware_schedule",
+    "print_summary_metrics",
+]
+
+
+# ---------------------------------------------------------------------------
+# Energy + tariff model (DEMO/SIMULATED data only)
+# ---------------------------------------------------------------------------
+
+def get_solar_availability(hour, solar_profile=None):
+    """
+    Get solar availability for a specific hour.
+
+    Profiles are 24-hour cyclic: hours beyond 24 (multi-day horizons) wrap
+    with hour % 24, so day-2 hour 25 uses the day-1 hour-1 value.
 
     Args:
-        hour: Hour of the day (0-23)
-
-    Returns:
-        Tariff in currency units per kWh (DEMO value, not a real price)
-    """
-    return DEMO_TARIFF_PROFILE.get(hour, 0)
-
-
-def get_solar_availability(hour):
-    """
-    Get solar availability for a specific hour from the DEMO profile.
-
-    Args:
-        hour: Hour of the day (0-23)
+        hour: Hour offset from schedule start (>= 0)
+        solar_profile: Optional profile dict (hour -> kW); defaults to DEMO
 
     Returns:
         Solar power availability in kW
     """
-    return DEMO_SOLAR_PROFILE.get(hour, 0)
+    profile = DEMO_SOLAR_PROFILE if solar_profile is None else solar_profile
+    return profile.get(hour % 24, 0)
 
 
-def calculate_solar_energy(process_start, process_end, process_power, time_scale=2):
+def get_tariff(hour, tariff_profile=None):
+    """
+    Get the electricity tariff for a specific hour.
+
+    Profiles are 24-hour cyclic: hours beyond 24 (multi-day horizons) wrap
+    with hour % 24.
+
+    Args:
+        hour: Hour offset from schedule start (>= 0)
+        tariff_profile: Optional profile dict (hour -> tariff/kWh); defaults
+            to DEMO
+
+    Returns:
+        Tariff in currency units per kWh
+    """
+    profile = DEMO_TARIFF_PROFILE if tariff_profile is None else tariff_profile
+    return profile.get(hour % 24, 0)
+
+
+def calculate_solar_energy(process_start, process_end, process_power,
+                           time_scale=TIME_SCALE, solar_profile=None):
     """
     Calculate solar energy used by a process during its actual scheduled duration.
+
+    Energy definition (generic):
+        per hour slot: solar = min(solar availability, process power) * duration
 
     Args:
         process_start: Process start time in hours
         process_end: Process end time in hours
         process_power: Process power consumption in kW
         time_scale: Time scaling factor for precision
+        solar_profile: Optional profile dict (hour -> kW); defaults to DEMO
 
     Returns:
         Tuple of (solar_energy_kwh, grid_energy_kwh, total_energy_kwh)
@@ -137,7 +189,7 @@ def calculate_solar_energy(process_start, process_end, process_power, time_scale
         duration_in_hour = hour_end - current_time
 
         # Get solar availability for this hour
-        solar_available = get_solar_availability(hour)
+        solar_available = get_solar_availability(hour, solar_profile)
 
         # Calculate energy used in this time slot based on process power consumption
         energy_in_slot = process_power * duration_in_hour
@@ -156,307 +208,9 @@ def calculate_solar_energy(process_start, process_end, process_power, time_scale
     return solar_energy, grid_energy, total_energy
 
 
-def create_baseline_schedule(factory_data):
-    """
-    Create a baseline production schedule (Version 1 - minimize makespan).
-
-    Args:
-        factory_data: Dictionary containing factory configuration and processes
-
-    Returns:
-        Dictionary with solver status and scheduled process times, or None if infeasible
-    """
-    # OR-Tools CP-SAT requires integer values
-    # Scale time units by a factor to handle fractional hours
-    TIME_SCALE = 2  # 1 unit = 0.5 hours (half-hour precision)
-
-    # Extract factory parameters and scale to integer units
-    planning_horizon = int(factory_data["planning_horizon_hours"] * TIME_SCALE)
-    production_deadline = int(factory_data["production_deadline"] * TIME_SCALE)
-    processes = factory_data["processes"]
-
-    # Create CP-SAT model
-    model = cp_model.CpModel()
-
-    # Create start-time and end-time variables for each process
-    start_times = {}
-    end_times = {}
-
-    for process in processes:
-        process_id = process["process_id"]
-        duration = int(process["duration_hours"] * TIME_SCALE)
-
-        # Start time variable: must be within planning horizon
-        start_times[process_id] = model.NewIntVar(
-            0, planning_horizon, f"start_{process_id}"
-        )
-
-        # End time variable: must be within planning horizon
-        end_times[process_id] = model.NewIntVar(
-            0, planning_horizon, f"end_{process_id}"
-        )
-
-        # Constraint: end_time = start_time + duration
-        model.Add(end_times[process_id] == start_times[process_id] + duration)
-
-        # Constraint: process must finish before production deadline
-        model.Add(end_times[process_id] <= production_deadline)
-
-    # Add dependency/precedence constraints
-    for process in processes:
-        process_id = process["process_id"]
-        dependencies = process["dependencies"]
-
-        for dep_id in dependencies:
-            # Dependency process must finish before this process starts
-            model.Add(end_times[dep_id] <= start_times[process_id])
-
-    # Objective: minimize the overall production completion time (makespan)
-    makespan = model.NewIntVar(0, planning_horizon, "makespan")
-    for process_id in start_times:
-        model.Add(makespan >= end_times[process_id])
-    model.Minimize(makespan)
-
-    # Solve the model
-    solver = cp_model.CpSolver()
-    status = solver.Solve(model)
-
-    # Check if solution is feasible
-    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        # Build schedule result
-        schedule = {
-            "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
-            "makespan": solver.Value(makespan) / TIME_SCALE,
-            "processes": []
-        }
-
-        for process in processes:
-            process_id = process["process_id"]
-            start_time = solver.Value(start_times[process_id]) / TIME_SCALE
-            end_time = solver.Value(end_times[process_id]) / TIME_SCALE
-
-            # Energy and grid cost of the baseline plan under the same
-            # solar/tariff conditions (used for baseline cost comparison)
-            solar_energy, grid_energy, total_energy = calculate_solar_energy(
-                start_time, end_time, process["power_kw"], TIME_SCALE
-            )
-            energy_cost = calculate_process_cost(
-                start_time, end_time, process["power_kw"], TIME_SCALE
-            )
-
-            schedule["processes"].append({
-                "process_id": process_id,
-                "process_name": process["process_name"],
-                "start_time": start_time,
-                "end_time": end_time,
-                "duration_hours": process["duration_hours"],
-                "power_kw": process["power_kw"],
-                "is_flexible": process["is_flexible"],
-                "solar_energy_kwh": solar_energy,
-                "grid_energy_kwh": grid_energy,
-                "tariff": get_tariff(int(start_time)),
-                "energy_cost": energy_cost
-            })
-
-        return schedule
-    else:
-        return None
-
-
-def create_solar_aware_schedule(factory_data, solar_profile):
-    """
-    Create a solar-aware production schedule that maximizes solar utilization
-    for flexible processes while respecting all production constraints.
-
-    Args:
-        factory_data: Dictionary containing factory configuration and processes
-        solar_profile: Dictionary mapping hours to solar availability in kW
-
-    Returns:
-        Dictionary with solver status, scheduled process times, and energy metrics,
-        or None if infeasible
-    """
-    # OR-Tools CP-SAT requires integer values
-    # Scale time units by a factor to handle fractional hours
-    TIME_SCALE = 2  # 1 unit = 0.5 hours (half-hour precision)
-
-    # Extract factory parameters and scale to integer units
-    planning_horizon = int(factory_data["planning_horizon_hours"] * TIME_SCALE)
-    production_deadline = int(factory_data["production_deadline"] * TIME_SCALE)
-    processes = factory_data["processes"]
-
-    # Create CP-SAT model
-    model = cp_model.CpModel()
-
-    # Create start-time and end-time variables for each process
-    start_times = {}
-    end_times = {}
-
-    for process in processes:
-        process_id = process["process_id"]
-        duration = int(process["duration_hours"] * TIME_SCALE)
-
-        # Start time variable: must be within planning horizon
-        start_times[process_id] = model.NewIntVar(
-            0, planning_horizon, f"start_{process_id}"
-        )
-
-        # End time variable: must be within planning horizon
-        end_times[process_id] = model.NewIntVar(
-            0, planning_horizon, f"end_{process_id}"
-        )
-
-        # Constraint: end_time = start_time + duration
-        model.Add(end_times[process_id] == start_times[process_id] + duration)
-
-        # Constraint: process must finish before production deadline
-        model.Add(end_times[process_id] <= production_deadline)
-
-    # Add dependency/precedence constraints
-    for process in processes:
-        process_id = process["process_id"]
-        dependencies = process["dependencies"]
-
-        for dep_id in dependencies:
-            # Dependency process must finish before this process starts
-            model.Add(end_times[dep_id] <= start_times[process_id])
-
-    # Non-flexible processes must remain non-flexible: pin their start times
-    # to the baseline (normal production plan) schedule.
-    baseline_schedule = create_baseline_schedule(factory_data)
-    if baseline_schedule is None:
-        return None
-    baseline_start_units = {
-        p["process_id"]: int(round(p["start_time"] * TIME_SCALE))
-        for p in baseline_schedule["processes"]
-    }
-    for process in processes:
-        if not process["is_flexible"]:
-            model.Add(
-                start_times[process["process_id"]]
-                == baseline_start_units[process["process_id"]]
-            )
-
-    # Objective: maximize total solar energy used by flexible processes,
-    # with makespan as a secondary tiebreaker.
-    #
-    # Energy definition (same as calculate_solar_energy()):
-    #   solar energy per time slot =
-    #       min(solar availability, process power consumption) * slot duration
-    # Since TIME_SCALE = 2, each scheduling slot is 0.5 hour.
-
-    slot_duration_hours = 1 / TIME_SCALE  # 0.5 hour per scheduling slot
-
-    # One contribution variable per flexible process
-    solar_contrib_vars = []
-
-    for process in processes:
-        if process["is_flexible"]:
-            process_id = process["process_id"]
-            duration = int(process["duration_hours"] * TIME_SCALE)
-            process_power = process["power_kw"]
-
-            # Integer-scaled variable for this process's solar energy contribution
-            solar_contrib = model.NewIntVar(0, 1000000, f"solar_contrib_{process_id}")
-
-            # Boolean for each possible start time slot of this process
-            slot_bools = []
-
-            # Calculate actual solar energy used for each possible start time slot
-            # Account for process power consumption, slot duration, and actual duration
-            for slot in range(0, planning_horizon - duration + 1):
-                actual_solar_energy = 0
-                for offset in range(duration):
-                    hour = int((slot + offset) / TIME_SCALE)
-                    solar_available = solar_profile.get(hour, 0)
-                    # min(solar availability, process power) * slot duration
-                    actual_solar_energy += (
-                        min(solar_available, process_power) * slot_duration_hours
-                    )
-
-                # Scale to integers for CP-SAT (0.1 kWh resolution)
-                solar_potential = int(round(actual_solar_energy * 10))
-
-                # Create boolean for this start time
-                starts_at_slot = model.NewBoolVar(f"starts_{process_id}_{slot}")
-                model.Add(start_times[process_id] == slot).OnlyEnforceIf(starts_at_slot)
-                model.Add(start_times[process_id] != slot).OnlyEnforceIf(starts_at_slot.Not())
-                slot_bools.append(starts_at_slot)
-
-                # Set the solar contribution based on start time
-                model.Add(solar_contrib == solar_potential).OnlyEnforceIf(starts_at_slot)
-
-            # Contribution is zero if this process starts outside all listed slots
-            model.Add(solar_contrib == 0).OnlyEnforceIf([b.Not() for b in slot_bools])
-
-            solar_contrib_vars.append(solar_contrib)
-
-    # total_solar_score = SUM of solar contributions from ALL flexible processes
-    total_solar_score = model.NewIntVar(0, 10000000, "total_solar_score")
-    model.Add(total_solar_score == sum(solar_contrib_vars))
-
-    # Secondary objective: minimize makespan (tiebreaker only)
-    makespan = model.NewIntVar(0, planning_horizon, "makespan")
-    model.AddMaxEquality(makespan, list(end_times.values()))
-
-    # Combined objective: maximize (total_solar_score * SOLAR_WEIGHT - makespan)
-    # total_solar_score is in 0.1 kWh units, so with SOLAR_WEIGHT = 100 a gain of
-    # 0.1 kWh of solar energy outweighs any possible makespan difference.
-    # The makespan term only breaks ties between schedules with equal solar energy.
-    SOLAR_WEIGHT = 100
-    model.Maximize(total_solar_score * SOLAR_WEIGHT - makespan)
-
-    # Solve the model
-    solver = cp_model.CpSolver()
-    status = solver.Solve(model)
-
-    # Check if solution is feasible
-    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        # Build schedule result with energy calculations
-        schedule = {
-            "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
-            "makespan": solver.Value(makespan) / TIME_SCALE,
-            "processes": [],
-            "total_energy_kwh": 0,
-            "total_solar_kwh": 0,
-            "total_grid_kwh": 0
-        }
-
-        for process in processes:
-            process_id = process["process_id"]
-            start_time = solver.Value(start_times[process_id]) / TIME_SCALE
-            end_time = solver.Value(end_times[process_id]) / TIME_SCALE
-
-            # Calculate solar, grid and total energy for this process
-            # Solar energy is calculated only over the actual scheduled duration
-            solar_energy, grid_energy, total_energy = calculate_solar_energy(
-                start_time, end_time, process["power_kw"], TIME_SCALE
-            )
-
-            # Update totals
-            schedule["total_energy_kwh"] += total_energy
-            schedule["total_solar_kwh"] += solar_energy
-            schedule["total_grid_kwh"] += grid_energy
-
-            schedule["processes"].append({
-                "process_id": process_id,
-                "process_name": process["process_name"],
-                "start_time": start_time,
-                "end_time": end_time,
-                "duration_hours": process["duration_hours"],
-                "power_kw": process["power_kw"],
-                "is_flexible": process["is_flexible"],
-                "solar_availability": get_solar_availability(int(start_time)),
-                "solar_energy_kwh": solar_energy,
-                "grid_energy_kwh": grid_energy
-            })
-
-        return schedule
-    else:
-        return None
-
-
-def calculate_process_cost(process_start, process_end, process_power, time_scale=2):
+def calculate_process_cost(process_start, process_end, process_power,
+                           time_scale=TIME_SCALE, solar_profile=None,
+                           tariff_profile=None):
     """
     Calculate the grid electricity cost of a process over its actual scheduled
     duration. Solar energy is free (not charged); only grid energy is billed
@@ -467,9 +221,11 @@ def calculate_process_cost(process_start, process_end, process_power, time_scale
         process_end: Process end time in hours
         process_power: Process power consumption in kW
         time_scale: Time scaling factor for precision (unused, kept for symmetry)
+        solar_profile: Optional profile dict (hour -> kW); defaults to DEMO
+        tariff_profile: Optional profile dict (hour -> tariff/kWh); defaults to DEMO
 
     Returns:
-        Total electricity cost in currency units
+        Total electricity cost in currency units (DEMO values)
     """
     total_cost = 0
 
@@ -483,75 +239,140 @@ def calculate_process_cost(process_start, process_end, process_power, time_scale
         # Energy used in this slot and the solar share (same definition as
         # calculate_solar_energy)
         energy_in_slot = process_power * duration_in_hour
-        solar_available = get_solar_availability(hour)
+        solar_available = get_solar_availability(hour, solar_profile)
         solar_in_slot = min(solar_available * duration_in_hour, energy_in_slot)
 
         # Only grid energy is billed at the hourly DEMO tariff
         grid_in_slot = energy_in_slot - solar_in_slot
-        total_cost += grid_in_slot * get_tariff(hour)
+        total_cost += grid_in_slot * get_tariff(hour, tariff_profile)
 
         current_time = hour_end
 
     return total_cost
 
 
-def create_cost_optimized_schedule(factory_data, solar_profile, tariff_profile):
+# ---------------------------------------------------------------------------
+# Configuration loading
+# ---------------------------------------------------------------------------
+
+def load_factory_config(factory_data):
     """
-    Create a solar + tariff cost-optimized production schedule (Version 3).
+    Load and validate any factory configuration dict into a FactoryConfig.
 
-    Primary objective: minimize total electricity cost.
-    Secondary objective: minimize makespan (tiebreaker when cost is equal).
-
-    The in-model cost of a scheduling slot uses the exact same energy and cost
-    definitions as the post-solve reporting functions:
-        solar energy per slot = min(solar availability, process power) * 0.5 h
-        grid energy per slot  = process power * 0.5 h - solar energy per slot
-        cost per slot         = grid energy * tariff[hour]
-
-    Args:
-        factory_data: Dictionary containing factory configuration and processes
-        solar_profile: Dictionary mapping hours to solar availability in kW
-        tariff_profile: Dictionary mapping hours to tariff per kWh (DEMO values)
-
-    Returns:
-        Dictionary with solver status, scheduled process times, energy metrics
-        and energy costs, or None if infeasible
+    Invalid configurations raise FactoryConfigError with a clear message
+    instead of silently producing an incorrect schedule.
     """
-    # OR-Tools CP-SAT requires integer values
-    # Scale time units by a factor to handle fractional hours
-    TIME_SCALE = 2  # 1 unit = 0.5 hours (half-hour precision)
+    if isinstance(factory_data, FactoryConfig):
+        return factory_data
+    return FactoryConfig(factory_data)
 
-    # Extract factory parameters and scale to integer units
-    planning_horizon = int(factory_data["planning_horizon_hours"] * TIME_SCALE)
-    production_deadline = int(factory_data["production_deadline"] * TIME_SCALE)
-    processes = factory_data["processes"]
 
-    slot_duration_hours = 1 / TIME_SCALE  # 0.5 hour per scheduling slot
+# ---------------------------------------------------------------------------
+# Shared model builder: generic production constraints
+# ---------------------------------------------------------------------------
 
-    # Integer scaling for costs: COST_SCALE * kWh * tariff = integer cost units
-    # (0.001 currency resolution is plenty of precision for DEMO tariffs)
-    COST_SCALE = 1000
+def _calculate_start_domains(config):
+    """Compute necessary start bounds from windows, deadlines, and precedence."""
+    horizon = time_to_grid_floor(config.planning_horizon_hours)
+    deadline = time_to_grid_floor(config.production_deadline)
+    process_order = [process.process_id for process in config.processes]
+    processes = {process.process_id: process for process in config.processes}
+    durations = {
+        process_id: int(round(processes[process_id].duration_hours * TIME_SCALE))
+        for process_id in process_order
+    }
+    earliest = {
+        process_id: time_to_grid_ceil(
+            processes[process_id].earliest_start
+            if processes[process_id].earliest_start is not None else 0
+        )
+        for process_id in process_order
+    }
+    latest = {}
+    successors = {process_id: [] for process_id in process_order}
+    pending = {}
+    for process_id in process_order:
+        process = processes[process_id]
+        finish_limit = min(
+            horizon,
+            deadline,
+            time_to_grid_floor(process.latest_finish)
+            if process.latest_finish is not None else deadline,
+        )
+        latest[process_id] = finish_limit - durations[process_id]
+        pending[process_id] = len(process.dependencies)
+        for dependency in process.dependencies:
+            successors[dependency].append(process_id)
 
-    # Create CP-SAT model
+    ready = [process_id for process_id in process_order
+             if pending[process_id] == 0]
+    topological_order = []
+    while ready:
+        process_id = ready.pop()
+        topological_order.append(process_id)
+        for successor in successors[process_id]:
+            earliest[successor] = max(
+                earliest[successor],
+                earliest[process_id] + durations[process_id],
+            )
+            pending[successor] -= 1
+            if pending[successor] == 0:
+                ready.append(successor)
+
+    for process_id in reversed(topological_order):
+        for successor in successors[process_id]:
+            latest[process_id] = min(
+                latest[process_id],
+                latest[successor] - durations[process_id],
+            )
+
+    return {
+        process_id: (earliest[process_id], latest[process_id])
+        for process_id in process_order
+    }
+
+
+def _build_base_model(config, prune_domains=True):
+    """
+    Build the shared CP-SAT model skeleton for a validated FactoryConfig:
+    variables, durations, deadline, dependencies, time windows, and
+    machine/resource no-overlap constraints.
+
+    Returns (model, start_times, end_times).
+    """
     model = cp_model.CpModel()
 
-    # Create start-time and end-time variables for each process
+    # OR-Tools CP-SAT requires integer values; TIME_SCALE units = 0.5 hours
+    planning_horizon = time_to_grid_floor(config.planning_horizon_hours)
+    production_deadline = time_to_grid_floor(config.production_deadline)
+    start_domains = _calculate_start_domains(config)
+
     start_times = {}
     end_times = {}
+    has_empty_domain = False
 
-    for process in processes:
-        process_id = process["process_id"]
-        duration = int(process["duration_hours"] * TIME_SCALE)
+    for process in config.processes:
+        process_id = process.process_id
+        duration = int(process.duration_hours * TIME_SCALE)
+        lower_start, upper_start = start_domains[process_id]
 
-        # Start time variable: must be within planning horizon
-        start_times[process_id] = model.NewIntVar(
-            0, planning_horizon, f"start_{process_id}"
-        )
-
-        # End time variable: must be within planning horizon
-        end_times[process_id] = model.NewIntVar(
-            0, planning_horizon, f"end_{process_id}"
-        )
+        if prune_domains and lower_start <= upper_start:
+            start_times[process_id] = model.NewIntVar(
+                lower_start, upper_start, f"start_{process_id}"
+            )
+            end_times[process_id] = model.NewIntVar(
+                lower_start + duration, upper_start + duration,
+                f"end_{process_id}"
+            )
+        else:
+            start_times[process_id] = model.NewIntVar(
+                0, planning_horizon, f"start_{process_id}"
+            )
+            end_times[process_id] = model.NewIntVar(
+                0, planning_horizon, f"end_{process_id}"
+            )
+            if prune_domains:
+                has_empty_domain = True
 
         # Constraint: end_time = start_time + duration
         model.Add(end_times[process_id] == start_times[process_id] + duration)
@@ -559,152 +380,641 @@ def create_cost_optimized_schedule(factory_data, solar_profile, tariff_profile):
         # Constraint: process must finish before production deadline
         model.Add(end_times[process_id] <= production_deadline)
 
-    # Add dependency/precedence constraints
-    for process in processes:
-        process_id = process["process_id"]
-        dependencies = process["dependencies"]
+        # Optional per-process time windows (generic constraint fields)
+        if process.earliest_start is not None:
+            model.Add(start_times[process_id] >= time_to_grid_ceil(
+                process.earliest_start
+            ))
+        if process.latest_finish is not None:
+            model.Add(end_times[process_id] <= time_to_grid_floor(
+                process.latest_finish
+            ))
 
-        for dep_id in dependencies:
-            # Dependency process must finish before this process starts
-            model.Add(end_times[dep_id] <= start_times[process_id])
+    if has_empty_domain:
+        model.Add(False)
 
-    # Objective: minimize total electricity cost of ALL processes.
-    # The cost expression is built exactly from the selected start times:
-    # each process contributes its slot costs via reified per-slot booleans.
-    cost_exprs = []
+    # Dependency/precedence constraints (supports sequential, parallel,
+    # independent, branching and merging structures - purely data-driven)
+    for process in config.processes:
+        for dep_id in process.dependencies:
+            model.Add(end_times[dep_id] <= start_times[process.process_id])
 
-    # Non-flexible processes must remain non-flexible: pin their start times
-    # to the baseline (normal production plan) schedule. Their grid cost is
-    # then constant and is reported from the actual schedule after solving.
-    baseline_schedule = create_baseline_schedule(factory_data)
-    if baseline_schedule is None:
+    # Machine/resource constraints: capacity is REAL. A machine with
+    # capacity 1 never runs two processes at once (NoOverlap); a machine
+    # with capacity >= 2 allows up to `capacity` simultaneous processes
+    # (AddCumulative with unit demands).
+    for machine_id, process_ids in config.processes_by_machine.items():
+        if len(process_ids) > 1:
+            machine = config.get_machine(machine_id)
+            capacity = max(1, int(machine.capacity or 1))
+            intervals = [
+                model.NewIntervalVar(
+                    start_times[pid],
+                    int(config.get_process(pid).duration_hours * TIME_SCALE),
+                    end_times[pid],
+                    f"interval_{machine_id}_{pid}",
+                )
+                for pid in process_ids
+            ]
+            if capacity == 1:
+                model.AddNoOverlap(intervals)
+            else:
+                model.AddCumulative(
+                    intervals,
+                    [config.get_process(pid).capacity_units
+                     for pid in process_ids],
+                    capacity,
+                )
+
+    return model, start_times, end_times
+
+
+def _pin_non_flexible_processes(config, model, start_times,
+                                baseline_schedule=None):
+    """
+    Pin non-flexible processes to their baseline start times: non-flexible
+    processes must remain at their baseline schedule positions.
+
+    Args:
+        baseline_schedule: Optional precomputed baseline schedule dict. When
+            provided it is reused as-is - identical pinning semantics, no
+            extra solver call. Computed internally when omitted.
+    """
+    baseline = baseline_schedule
+    if baseline is None:
+        baseline = create_baseline_schedule(config)
+    if baseline is None:
         return None
     baseline_start_units = {
         p["process_id"]: int(round(p["start_time"] * TIME_SCALE))
-        for p in baseline_schedule["processes"]
+        for p in baseline["processes"]
     }
-    for process in processes:
-        if not process["is_flexible"]:
+    fixed_start_units = {
+        process.process_id: baseline_start_units[process.process_id]
+        for process in config.processes
+        if not process.is_flexible
+    }
+    for process in config.processes:
+        if not process.is_flexible:
             model.Add(
-                start_times[process["process_id"]]
-                == baseline_start_units[process["process_id"]]
+                start_times[process.process_id]
+                == baseline_start_units[process.process_id]
+            )
+    return baseline
+
+
+def _slots_touching_hour(hour, duration, horizon_slots):
+    """
+    Yield (slot, count) for every possible start slot whose run touches
+    clock hour, with count = number of its half-hour slots inside that
+    hour (TIME_SCALE slots per hour).
+    """
+    hour_start = hour * TIME_SCALE
+    hour_end = hour_start + TIME_SCALE
+    first = max(0, hour_start - duration + 1)
+    last = min(hour_end - 1, horizon_slots - duration)
+    for slot in range(first, last + 1):
+        overlap = min(slot + duration, hour_end) - max(slot, hour_start)
+        if overlap > 0:
+            yield slot, overlap
+
+
+def _add_shared_solar_pool(config, model, start_times, solar_profile,
+                           prune_domains=True, fixed_start_times=None):
+    """
+    Encode solar as a SHARED hourly resource INSIDE the CP-SAT model.
+
+    For every clock hour h the model carries an integer variable used[h]
+    (0.1 kWh units, SOLAR_SCALE) - the total solar energy allocated to
+    processes in that hour - subject to:
+
+        used[h] <= solar_profile[h % 24]        (the physical pool)
+        used[h] <= sum_p draw_cap[p, h]         (per-process demand caps)
+
+    draw_cap[p, h] is a linear expression over run[p, t] booleans
+    ("process p starts at slot t", exactly-one linked to the existing
+    start-time variables): a running process can draw at most
+    min(solar_kw, power_kw) per occupied half-hour slot, and nothing in
+    hours it does not occupy.
+
+    The aggregate form is exact: for any fixed schedule the deterministic
+    greedy split used for reporting realizes exactly
+    min(pool, sum of draw caps) per hour - precisely the model's upper
+    bound - so optimized objective values equal reported numbers. The
+    pool constraint is part of the optimization model, not a post-solve
+    adjustment.
+
+    Returns:
+        (used, demand): dicts keyed by hour (int).
+        used[h]   IntVar - total allocated solar in hour h, 0.1 kWh units
+        demand[h] linear expression - total process energy demand in
+        hour h, 0.1 kWh units
+    """
+    horizon_slots = time_to_grid_floor(config.planning_horizon_hours)
+    horizon_hours = (horizon_slots + TIME_SCALE - 1) // TIME_SCALE
+    start_domains = _calculate_start_domains(config)
+    fixed_start_times = fixed_start_times or {}
+
+    # run[p, t] == 1  <=>  process p starts at slot t: two-directional
+    # reification (b forces the start; a start != slot forces b false) plus
+    # exactly-one, giving CP-SAT a tight channel between booleans and the
+    # existing start-time variables.
+    run = {}
+    for process in config.processes:
+        pid = process.process_id
+        duration = int(process.duration_hours * TIME_SCALE)
+        lower_start, upper_start = start_domains[pid]
+        if prune_domains and pid in fixed_start_times:
+            lower_start = upper_start = fixed_start_times[pid]
+        if not prune_domains:
+            lower_start, upper_start = 0, horizon_slots - duration
+        first_slot = max(0, lower_start)
+        last_slot = min(horizon_slots - duration, upper_start)
+        bools = []
+        for slot in range(first_slot, last_slot + 1):
+            b = model.NewBoolVar(f"run_{pid}_{slot}")
+            model.Add(start_times[pid] == slot).OnlyEnforceIf(b)
+            model.Add(start_times[pid] != slot).OnlyEnforceIf(b.Not())
+            bools.append(b)
+            run[(pid, slot)] = b
+        if bools or not prune_domains:
+            model.AddExactlyOne(bools)
+
+    # Per-hour aggregate: physical pool cap + total draw cap, with demand.
+    used = {}
+    demand = {}
+    for hour in range(horizon_hours):
+        solar_kw = solar_profile.get(hour % 24, 0)
+        pool_u = max(int(round(solar_kw * SOLAR_SCALE)), 0)
+        cap_terms = []
+        demand_terms = []
+        for process in config.processes:
+            pid = process.process_id
+            power = process.power_kw
+            duration = int(process.duration_hours * TIME_SCALE)
+            per_slot_u = int(round(min(solar_kw, power) * 0.5 * SOLAR_SCALE))
+            per_slot_demand_u = int(round(power * 0.5 * SOLAR_SCALE))
+            for slot, cnt in _slots_touching_hour(hour, duration,
+                                                  horizon_slots):
+                run_variable = run.get((pid, slot))
+                if run_variable is not None:
+                    cap_terms.append(per_slot_u * cnt * run_variable)
+                    demand_terms.append(
+                        per_slot_demand_u * cnt * run_variable
+                    )
+        u = model.NewIntVar(0, pool_u, f"solar_used_{hour}")
+        if cap_terms:
+            model.Add(u <= sum(cap_terms, 0))
+        used[hour] = u
+        demand[hour] = sum(demand_terms, 0)
+
+    return used, demand
+
+
+def allocate_solar_greedy(rows, solar_profile, tariff_profile=None):
+    """
+    Deterministic SHARED-SOLAR allocation for reporting.
+
+    Solar is a shared resource: within each clock hour, concurrent processes
+    collectively receive at most the available solar energy. Each running
+    process can additionally draw at most its own power demand over the part
+    of the hour it occupies (supply_kw x overlap_hours). Allocation is greedy
+    in process_id order (deterministic); the hourly pool is never exceeded
+    and no process is credited solar from a time it was not running.
+
+    Args:
+        rows: list of dicts with process_id, start_time, end_time, power_kw
+        solar_profile: hour -> kW (24-hour cyclic)
+        tariff_profile: optional hour -> tariff/kWh; when given, per-row
+            grid cost (grid kWh x hourly tariff) is included
+
+    Returns:
+        dict process_id -> {"solar_kwh", "grid_kwh", "energy_cost"}
+        (energy_cost is 0.0 when no tariff_profile is given)
+    """
+    # Collect running processes per clock hour with their overlap duration
+    running_by_hour = {}
+    for row in rows:
+        t = row["start_time"]
+        while t < row["end_time"]:
+            hour = int(t)
+            overlap = min(hour + 1, row["end_time"]) - t
+            running_by_hour.setdefault(hour, []).append(
+                (row["process_id"], row["power_kw"] * overlap, overlap)
+            )
+            t += overlap
+
+    allocation = {
+        row["process_id"]: {"solar_kwh": 0.0, "grid_kwh": 0.0,
+                            "energy_cost": 0.0}
+        for row in rows
+    }
+
+    for hour, runners in running_by_hour.items():
+        supply_kw = get_solar_availability(hour, solar_profile)
+        supply_kwh = supply_kw * 1.0  # shared pool: one clock hour
+        # Deterministic order: process_id
+        for pid, demand_kwh, overlap in sorted(runners):
+            # Per-process draw cap: the process can only use solar while it
+            # actually runs in this hour (supply_kw x overlap), and never
+            # more than its own demand or the pool remaining.
+            draw_cap_kwh = supply_kw * overlap
+            solar_kwh = min(demand_kwh, draw_cap_kwh, max(supply_kwh, 0.0))
+            supply_kwh -= solar_kwh
+            grid_kwh = demand_kwh - solar_kwh
+            allocation[pid]["solar_kwh"] += solar_kwh
+            allocation[pid]["grid_kwh"] += grid_kwh
+            if tariff_profile is not None:
+                allocation[pid]["energy_cost"] += (
+                    grid_kwh * get_tariff(hour, tariff_profile)
+                )
+    return allocation
+
+
+def _extract_schedule(config, solver, status_name, start_times, end_times,
+                      solar_profile, tariff_profile, with_cost):
+    """Build the schedule result dict from a solved model (generic)."""
+    # Pass 1: collect scheduled times (shared-solar allocation needs ALL
+    # concurrent processes before splitting the hourly supply)
+    times = []
+    for process in config.processes:
+        times.append((
+            process,
+            solver.Value(start_times[process.process_id]) / TIME_SCALE,
+            solver.Value(end_times[process.process_id]) / TIME_SCALE,
+        ))
+
+    rows = [
+        {"process_id": p.process_id, "start_time": s, "end_time": e,
+         "power_kw": p.power_kw}
+        for p, s, e in times
+    ]
+    allocation = allocate_solar_greedy(rows, solar_profile,
+                                       tariff_profile if with_cost else None)
+
+    schedule = {
+        "status": status_name,
+        "factory_name": config.factory_name,
+        "makespan": max(e for _, _, e in times),
+        "solve_time_seconds": round(solver.WallTime(), 4) if solver is not None else None,
+        "processes": [],
+        "total_energy_kwh": 0,
+        "total_solar_kwh": 0,
+        "total_grid_kwh": 0,
+    }
+    if with_cost:
+        schedule["total_energy_cost"] = 0
+
+    for process, start_time, end_time in times:
+        alloc = allocation[process.process_id]
+        solar_energy = alloc["solar_kwh"]
+        grid_energy = alloc["grid_kwh"]
+        total_energy = process.power_kw * process.duration_hours
+
+        entry = {
+            "process_id": process.process_id,
+            "process_name": process.process_name,
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration_hours": process.duration_hours,
+            "power_kw": process.power_kw,
+            "is_flexible": process.is_flexible,
+            "machine_id": process.machine_id,
+            "quantity": process.quantity,
+            "solar_availability": get_solar_availability(int(start_time), solar_profile),
+            "solar_energy_kwh": solar_energy,
+            "grid_energy_kwh": grid_energy,
+        }
+        if with_cost:
+            energy_cost = alloc["energy_cost"]
+            entry["tariff"] = get_tariff(int(start_time), tariff_profile)
+            entry["energy_cost"] = energy_cost
+            schedule["total_energy_cost"] += energy_cost
+
+        schedule["total_energy_kwh"] += total_energy
+        schedule["total_solar_kwh"] += solar_energy
+        schedule["total_grid_kwh"] += grid_energy
+        schedule["processes"].append(entry)
+
+    return schedule
+
+
+# ---------------------------------------------------------------------------
+# V1: Baseline schedule (minimize makespan)
+# ---------------------------------------------------------------------------
+
+def create_baseline_schedule(factory_data, solar_profile=None,
+                             tariff_profile=None, max_time_seconds=None,
+                             raise_on_infeasible=False):
+    """
+    Create a baseline production schedule (Version 1 - minimize makespan).
+
+    Accepts any factory configuration dict (or a validated FactoryConfig).
+
+    Args:
+        factory_data: Generic factory configuration
+        solar_profile: Optional profile dict (hour -> kW); defaults to DEMO.
+            Used only for reported energy/cost of the baseline plan.
+        tariff_profile: Optional profile dict (hour -> tariff/kWh); defaults
+            to DEMO. Used only for reported baseline cost.
+
+    Returns:
+        Dictionary with solver status and scheduled process times (including
+        each process's energy/cost under the given profiles for comparison),
+        or None if infeasible
+    """
+    config = load_factory_config(factory_data)
+    model, start_times, end_times = _build_base_model(config)
+
+    # Objective: minimize the overall production completion time (makespan)
+    makespan = model.NewIntVar(
+        0, time_to_grid_floor(config.planning_horizon_hours), "makespan"
+    )
+    for process_id in start_times:
+        model.Add(makespan >= end_times[process_id])
+    model.Minimize(makespan)
+
+    # Solve the model (deterministic single-worker; optional time limit)
+    solver = _new_solver(max_time_seconds)
+    status = solver.Solve(model)
+
+    # Check if solution is feasible
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        return _extract_schedule(
+            config,
+            solver,
+            "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
+            start_times,
+            end_times,
+            DEMO_SOLAR_PROFILE if solar_profile is None else solar_profile,
+            DEMO_TARIFF_PROFILE if tariff_profile is None else tariff_profile,
+            with_cost=True,
+        )
+    elif status == cp_model.UNKNOWN:
+        raise SolverUnknownError(
+            "baseline solve hit the time limit without finding a solution "
+            "and without proving infeasibility",
+            solve_time_seconds=round(solver.WallTime(), 4),
+        )
+    elif status == cp_model.INFEASIBLE and raise_on_infeasible:
+        raise SolverInfeasibleError(round(solver.WallTime(), 4))
+    else:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# V2: Solar-aware schedule (maximize solar energy, makespan tiebreaker)
+# ---------------------------------------------------------------------------
+
+def create_solar_aware_schedule(factory_data, solar_profile=None,
+                                tariff_profile=None, baseline_schedule=None,
+                                max_time_seconds=None,
+                                raise_on_infeasible=False):
+    """
+    Create a solar-aware production schedule that maximizes solar utilization
+    for flexible processes while respecting all production constraints.
+
+    Objective (unchanged from V2/V3 semantics): maximize the solar energy of
+    flexible processes, with makespan as a secondary tiebreaker.
+
+    Args:
+        factory_data: Generic factory configuration
+        solar_profile: Optional profile dict (hour -> kW); defaults to DEMO.
+            Drives BOTH the optimization objective and reported energy.
+        tariff_profile: Optional profile dict (hour -> tariff/kWh); defaults
+            to DEMO. Used only for reported cost.
+        baseline_schedule: Optional precomputed baseline schedule dict; reused
+            for non-flexible pinning instead of solving the baseline again.
+
+    Returns:
+        Dictionary with solver status, scheduled process times, and energy
+        metrics, or None if infeasible
+    """
+    config = load_factory_config(factory_data)
+    profile = DEMO_SOLAR_PROFILE if solar_profile is None else solar_profile
+    precision_problems = energy_precision_problems(
+        config.processes, profile,
+        DEMO_TARIFF_PROFILE if tariff_profile is None else tariff_profile,
+    )
+    if precision_problems:
+        raise FactoryConfigError("; ".join(precision_problems))
+    model, start_times, end_times = _build_base_model(config)
+
+    # Non-flexible processes must remain at their baseline positions
+    baseline = _pin_non_flexible_processes(
+        config, model, start_times, baseline_schedule
+    )
+    if baseline is None:
+        return None
+
+    # Add solution hints from baseline schedule to speed up optimality proof
+    # This gives CP-SAT a high-quality starting point
+    baseline_start_units = {
+        p["process_id"]: int(round(p["start_time"] * TIME_SCALE))
+        for p in baseline["processes"]
+    }
+    fixed_start_units = {
+        process.process_id: baseline_start_units[process.process_id]
+        for process in config.processes
+        if not process.is_flexible
+    }
+    for process in config.processes:
+        if process.process_id in baseline_start_units:
+            model.AddHint(
+                start_times[process.process_id],
+                baseline_start_units[process.process_id]
             )
 
-    for process in processes:
-        # Only flexible processes contribute a variable cost term
-        if not process["is_flexible"]:
-            continue
+    # Objective: maximize total ALLOCATED solar energy under the SHARED
+    # hourly pool (makespan as a secondary tiebreaker). The pool lives
+    # inside the model, so the optimizer sees exactly the physical solar
+    # that post-solve reporting allocates.
+    planning_horizon = time_to_grid_floor(config.planning_horizon_hours)
 
-        process_id = process["process_id"]
-        duration = int(process["duration_hours"] * TIME_SCALE)
-        process_power = process["power_kw"]
+    share, demand = _add_shared_solar_pool(
+        config, model, start_times, profile,
+        fixed_start_times=fixed_start_units,
+    )
 
-        # Integer-scaled cost variable for this process
-        process_cost = model.NewIntVar(0, 100000000, f"cost_{process_id}")
+    # total_solar_score = SUM of allocated solar over ALL hours (0.1 kWh
+    # units; per-process splits are realized by the reporting allocator).
+    total_solar_score = sum(share.values(), 0)
 
-        # Boolean for each possible start time slot of this process
-        slot_bools = []
+    # Secondary objective: minimize makespan (tiebreaker only)
+    makespan = model.NewIntVar(0, planning_horizon, "makespan")
+    model.AddMaxEquality(makespan, list(end_times.values()))
 
-        for slot in range(0, planning_horizon - duration + 1):
-            # Exact grid cost for a run starting at this slot (integer units),
-            # using the same energy definition as calculate_solar_energy():
-            #   solar per slot = min(solar availability, power) * 0.5 h
-            #   grid per slot  = power * 0.5 h - solar per slot
-            #   cost per slot  = grid * tariff[hour]
-            actual_cost = 0
-            for offset in range(duration):
-                hour = int((slot + offset) / TIME_SCALE)
-                solar_available = solar_profile.get(hour, 0)
-                slot_energy = process_power * slot_duration_hours
-                slot_solar = min(solar_available, process_power) * slot_duration_hours
-                slot_grid = slot_energy - slot_solar
-                actual_cost += slot_grid * tariff_profile.get(hour, 0)
+    # Combined objective: maximize (total_solar_score * SOLAR_WEIGHT - makespan)
+    # total_solar_score is in 0.1 kWh units; SOLAR_WEIGHT guarantees a gain
+    # of one solar unit outweighs any possible makespan difference.
+    SOLAR_WEIGHT = planning_horizon + 1
+    model.Maximize(total_solar_score * SOLAR_WEIGHT - makespan)
 
-            cost_potential = int(round(actual_cost * COST_SCALE))
+    # Solve the model (deterministic single-worker; optional time limit)
+    solver = _new_solver(max_time_seconds)
+    status = solver.Solve(model)
 
-            # Create boolean for this start time
-            starts_at_slot = model.NewBoolVar(f"starts_{process_id}_{slot}")
-            model.Add(start_times[process_id] == slot).OnlyEnforceIf(starts_at_slot)
-            model.Add(start_times[process_id] != slot).OnlyEnforceIf(starts_at_slot.Not())
-            slot_bools.append(starts_at_slot)
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        return _extract_schedule(
+            config,
+            solver,
+            "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
+            start_times,
+            end_times,
+            profile,
+            DEMO_TARIFF_PROFILE if tariff_profile is None else tariff_profile,
+            with_cost=True,
+        )
+    elif status == cp_model.UNKNOWN:
+        raise SolverUnknownError(
+            "solar-aware solve hit the time limit without finding a solution "
+            "and without proving infeasibility",
+            solve_time_seconds=round(solver.WallTime(), 4),
+        )
+    elif status == cp_model.INFEASIBLE and raise_on_infeasible:
+        raise SolverInfeasibleError(round(solver.WallTime(), 4))
+    else:
+        return None
 
-            # Set the cost contribution based on start time
-            model.Add(process_cost == cost_potential).OnlyEnforceIf(starts_at_slot)
 
-        # Cost is zero if this process starts outside all listed slots
-        model.Add(process_cost == 0).OnlyEnforceIf([b.Not() for b in slot_bools])
+# ---------------------------------------------------------------------------
+# V3: Solar + tariff cost-optimized schedule (primary: cost, tiebreak: makespan)
+# ---------------------------------------------------------------------------
 
-        # SUM of contributions from ALL processes (exact aggregation)
-        cost_exprs.append(process_cost)
+def create_cost_optimized_schedule(factory_data, solar_profile=None,
+                                   tariff_profile=None, baseline_schedule=None,
+                                   max_time_seconds=None,
+                                   raise_on_infeasible=False):
+    """
+    Create a solar + tariff cost-optimized production schedule (Version 3+).    Primary objective: minimize total electricity cost.
+    Secondary objective: minimize makespan (tiebreaker when cost is equal).
+
+    Solar is a SHARED hourly pool inside the model (see
+    _add_shared_solar_pool): the in-model energy and cost definitions are
+    exactly the post-solve reporting definitions applied to the hourly
+    pool:
+        solar allocated in an hour <= min(pool supply, total draw caps)
+        grid energy per hour  = total demand - allocated solar
+        cost per hour         = grid energy * tariff[hour]
+
+    Args:
+        factory_data: Generic factory configuration
+        solar_profile: Optional profile dict (hour -> kW); defaults to DEMO.
+            Drives BOTH the optimization objective and reported energy.
+        tariff_profile: Optional profile dict (hour -> tariff/kWh); defaults
+            to DEMO. Drives BOTH the optimization objective and reported cost.
+        baseline_schedule: Optional precomputed baseline schedule dict; reused
+            for non-flexible pinning instead of solving the baseline again.
+
+    Returns:
+        Dictionary with solver status, scheduled process times, energy metrics
+        and energy costs, or None if infeasible
+    """
+    config = load_factory_config(factory_data)
+    s_profile = DEMO_SOLAR_PROFILE if solar_profile is None else solar_profile
+    t_profile = DEMO_TARIFF_PROFILE if tariff_profile is None else tariff_profile
+    precision_problems = energy_precision_problems(
+        config.processes, s_profile, t_profile
+    )
+    if precision_problems:
+        raise FactoryConfigError("; ".join(precision_problems))
+
+    model, start_times, end_times = _build_base_model(config)
+
+    # Integer scaling for costs (0.001 currency resolution for DEMO tariffs)
+    COST_SCALE = 1000
+
+    planning_horizon = time_to_grid_floor(config.planning_horizon_hours)
+
+    # Non-flexible processes must remain at their baseline positions: their
+    # grid cost is then constant and is reported from the actual schedule.
+    baseline = _pin_non_flexible_processes(
+        config, model, start_times, baseline_schedule
+    )
+    if baseline is None:
+        return None
+
+    # Add solution hints from baseline schedule to speed up optimality proof
+    # This gives CP-SAT a high-quality starting point
+    baseline_start_units = {
+        p["process_id"]: int(round(p["start_time"] * TIME_SCALE))
+        for p in baseline["processes"]
+    }
+    fixed_start_units = {
+        process.process_id: baseline_start_units[process.process_id]
+        for process in config.processes
+        if not process.is_flexible
+    }
+    for process in config.processes:
+        if process.process_id in baseline_start_units:
+            model.AddHint(
+                start_times[process.process_id],
+                baseline_start_units[process.process_id]
+            )
+
+    # Solar is a SHARED hourly pool INSIDE the model (see helper): the cost
+    # objective therefore optimizes against physically available solar, the
+    # same allocation rule post-solve reporting applies.
+    share, demand = _add_shared_solar_pool(
+        config, model, start_times, s_profile,
+        fixed_start_times=fixed_start_units,
+    )
+
+    # Objective: minimize total grid electricity cost. Per clock hour:
+    #     grid energy = process demand - allocated (shared) solar
+    #     cost        = grid energy x tariff[hour]
+    # All terms are integer linear expressions (solar units = 0.1 kWh).
+    horizon_hours = (planning_horizon + TIME_SCALE - 1) // TIME_SCALE
+    tariff_mille = {
+        hour: int(round(get_tariff(hour, t_profile) * COST_SCALE))
+        for hour in range(horizon_hours)
+    }
+    cost_terms = [
+        tariff_mille[hour % 24] * (demand[hour] - share[hour])
+        for hour in range(horizon_hours)
+    ]
+    total_cost_expr = sum(cost_terms, 0)
 
     # Secondary objective: minimize makespan (tiebreaker only)
     makespan = model.NewIntVar(0, planning_horizon, "makespan")
     model.AddMaxEquality(makespan, list(end_times.values()))
 
     # Primary objective: minimize total electricity cost.
-    # Makespan is scaled to a small value relative to costs so it only breaks
-    # ties between schedules with identical cost, never overriding cost.
-    MAKESPAN_TIEBREAK_SCALE = 1000
-    total_cost_expr = sum(cost_exprs, 0)
+    # The tiebreak scale guarantees any positive cost difference (1 unit =
+    # 0.0001 currency) outweighs any possible makespan difference.
+    MAKESPAN_TIEBREAK_SCALE = planning_horizon + 1
     model.Minimize(total_cost_expr * MAKESPAN_TIEBREAK_SCALE + makespan)
 
-    # Solve the model
-    solver = cp_model.CpSolver()
+    # Solve the model (deterministic single-worker; optional time limit)
+    solver = _new_solver(max_time_seconds)
     status = solver.Solve(model)
 
-    # Check if solution is feasible
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        # Build schedule result with energy and cost calculations
-        schedule = {
-            "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
-            "makespan": solver.Value(makespan) / TIME_SCALE,
-            "processes": [],
-            "total_energy_kwh": 0,
-            "total_solar_kwh": 0,
-            "total_grid_kwh": 0,
-            "total_energy_cost": 0
-        }
-
-        for process in processes:
-            process_id = process["process_id"]
-            start_time = solver.Value(start_times[process_id]) / TIME_SCALE
-            end_time = solver.Value(end_times[process_id]) / TIME_SCALE
-
-            # Calculate solar, grid and total energy for this process
-            solar_energy, grid_energy, total_energy = calculate_solar_energy(
-                start_time, end_time, process["power_kw"], TIME_SCALE
-            )
-
-            # Calculate grid electricity cost from the actual optimized schedule
-            energy_cost = calculate_process_cost(
-                start_time, end_time, process["power_kw"], TIME_SCALE
-            )
-
-            # Update totals
-            schedule["total_energy_kwh"] += total_energy
-            schedule["total_solar_kwh"] += solar_energy
-            schedule["total_grid_kwh"] += grid_energy
-            schedule["total_energy_cost"] += energy_cost
-
-            schedule["processes"].append({
-                "process_id": process_id,
-                "process_name": process["process_name"],
-                "start_time": start_time,
-                "end_time": end_time,
-                "duration_hours": process["duration_hours"],
-                "power_kw": process["power_kw"],
-                "is_flexible": process["is_flexible"],
-                "solar_availability": get_solar_availability(int(start_time)),
-                "solar_energy_kwh": solar_energy,
-                "grid_energy_kwh": grid_energy,
-                "tariff": get_tariff(int(start_time)),
-                "energy_cost": energy_cost
-            })
-
-        return schedule
+        return _extract_schedule(
+            config,
+            solver,
+            "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
+            start_times,
+            end_times,
+            s_profile,
+            t_profile,
+            with_cost=True,
+        )
+    elif status == cp_model.UNKNOWN:
+        raise SolverUnknownError(
+            "cost-optimized solve hit the time limit without finding a "
+            "solution and without proving infeasibility",
+            solve_time_seconds=round(solver.WallTime(), 4),
+        )
+    elif status == cp_model.INFEASIBLE and raise_on_infeasible:
+        raise SolverInfeasibleError(round(solver.WallTime(), 4))
     else:
         return None
 
+
+# ---------------------------------------------------------------------------
+# Readable console output (generic - only display names are printed)
+# ---------------------------------------------------------------------------
 
 def print_baseline_schedule(schedule):
     """
@@ -719,7 +1029,7 @@ def print_baseline_schedule(schedule):
         return
 
     print("=" * 80)
-    print("BASELINE SCHEDULE")
+    print(f"BASELINE SCHEDULE - {schedule.get('factory_name', 'Factory')}")
     print("=" * 80)
     print(f"Solver Status: {schedule['status']}")
     print(f"Overall Production Completion Time (Makespan): {schedule['makespan']} hours")
@@ -727,7 +1037,8 @@ def print_baseline_schedule(schedule):
     print()
 
     # Print header
-    print(f"{'Process Name':<20} {'Start':<10} {'End':<10} {'Duration':<10} {'Power (kW)':<12} {'Flexible':<10}")
+    print(f"{'Process Name':<20} {'Start':<10} {'End':<10} {'Duration':<10} "
+          f"{'Power (kW)':<12} {'Flexible':<10}")
     print("-" * 80)
 
     # Print each process
@@ -761,7 +1072,7 @@ def print_solar_aware_schedule(schedule):
         return
 
     print("=" * 80)
-    print("SOLAR + TARIFF OPTIMIZED SCHEDULE")
+    print(f"SOLAR + TARIFF OPTIMIZED SCHEDULE - {schedule.get('factory_name', 'Factory')}")
     print("=" * 80)
     print(f"Solver Status: {schedule['status']}")
     print(f"Overall Production Completion Time (Makespan): {schedule['makespan']} hours")
@@ -769,7 +1080,9 @@ def print_solar_aware_schedule(schedule):
     print()
 
     # Print header
-    print(f"{'Process Name':<20} {'Start':<10} {'End':<10} {'Duration':<10} {'Power (kW)':<12} {'Flexible':<10} {'Solar (kW)':<12} {'Solar (kWh)':<12} {'Grid (kWh)':<12} {'Tariff':<12} {'Cost':<12}")
+    print(f"{'Process Name':<20} {'Start':<10} {'End':<10} {'Duration':<10} "
+          f"{'Power (kW)':<12} {'Flexible':<10} {'Solar (kW)':<12} "
+          f"{'Solar (kWh)':<12} {'Grid (kWh)':<12} {'Tariff':<12} {'Cost':<12}")
     print("-" * 150)
 
     # Print each process
@@ -828,11 +1141,13 @@ def print_summary_metrics(baseline_schedule, optimized_schedule):
 
         # Count flexible processes shifted
         flexible_shifted = 0
-        baseline_start_times = {p["process_id"]: p["start_time"] for p in baseline_schedule["processes"]}
+        baseline_start_times = {
+            p["process_id"]: p["start_time"] for p in baseline_schedule["processes"]
+        }
         for process in optimized_schedule["processes"]:
             if process["is_flexible"]:
                 baseline_start = baseline_start_times[process["process_id"]]
-                if abs(process["start_time"] - baseline_start) > 0.1:  # More than 0.1 hour difference
+                if abs(process["start_time"] - baseline_start) > 0.1:
                     flexible_shifted += 1
 
         print(f"Baseline Makespan: {baseline_makespan:.2f} hours")
@@ -852,29 +1167,15 @@ def print_summary_metrics(baseline_schedule, optimized_schedule):
     print("=" * 80)
 
 
-def main():
-    """Main function to run the optimizer."""
-    print("ByteMe Manufacturing Energy Scheduler - Version 3")
-    print("Solar + Tariff Cost Optimization (Demand Shifting)")
-    print()
-
-    # Generate baseline schedule
-    print("Generating baseline schedule...")
-    baseline_schedule = create_baseline_schedule(DEMO_CHOCOLATE_FACTORY)
-    print()
-
-    # Generate solar + tariff cost-optimized schedule (Version 3)
-    print("Generating solar + tariff optimized schedule...")
-    optimized_schedule = create_cost_optimized_schedule(
-        DEMO_CHOCOLATE_FACTORY, DEMO_SOLAR_PROFILE, DEMO_TARIFF_PROFILE
-    )
-    print()
-
-    # Print results
-    print_baseline_schedule(baseline_schedule)
-    print_solar_aware_schedule(optimized_schedule)
-    print_summary_metrics(baseline_schedule, optimized_schedule)
+# NOTE: this engine module intentionally contains NO factory definitions and
+# NO demo-data imports beyond the energy profiles. The console entry point
+# that runs the registered demo factories lives in optimizer/cli.py
+# (run it with `python -m optimizer`).
 
 
 if __name__ == "__main__":
-    main()
+    # Backward compatibility: the V1-V3 demo command still runs the demo,
+    # now via the separated CLI layer.
+    from optimizer.cli import main as _main
+
+    _main()

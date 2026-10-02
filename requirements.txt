@@ -1,0 +1,3 @@
+# ByteMe optimizer dependencies (DEMO/SIMULATED system)
+# Pinned for reproducible environments; do not upgrade casually.
+ortools==9.15.6755

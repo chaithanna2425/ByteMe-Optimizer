@@ -1,0 +1,76 @@
+{
+  "_comment": "ByteMe user-input example (DEMO/SIMULATED DATA - NOT REAL INDUSTRIAL DATA). Add an eighth factory by providing a file like this - no Python or optimizer changes required.",
+  "factory": {
+    "factory_name": "Demo Widget Lab",
+    "factory_type": "widgets",
+    "planning_horizon_hours": 12,
+    "production_deadline": 10,
+    "processes": [
+      {
+        "process_id": "step_x",
+        "process_name": "Step X",
+        "duration_hours": 1,
+        "power_kw": 10,
+        "quantity": 100,
+        "dependencies": [],
+        "is_flexible": false,
+        "machine_id": "core",
+        "earliest_start": null,
+        "latest_finish": null
+      },
+      {
+        "process_id": "step_y",
+        "process_name": "Step Y",
+        "duration_hours": 1.5,
+        "power_kw": 8,
+        "quantity": 100,
+        "dependencies": ["step_x"],
+        "is_flexible": true,
+        "machine_id": "core",
+        "earliest_start": null,
+        "latest_finish": null
+      },
+      {
+        "process_id": "step_z",
+        "process_name": "Step Z",
+        "duration_hours": 1,
+        "power_kw": 6,
+        "quantity": 100,
+        "dependencies": ["step_x"],
+        "is_flexible": true,
+        "machine_id": "polisher",
+        "earliest_start": 2,
+        "latest_finish": 9
+      }
+    ],
+    "machines": [
+      {
+        "machine_id": "core",
+        "machine_name": "Shared Core Machine",
+        "availability": "single unit",
+        "capacity": 100,
+        "power_kw": 12,
+        "compatible_processes": ["step_x", "step_y"]
+      },
+      {
+        "machine_id": "polisher",
+        "machine_name": "Polishing Bench",
+        "availability": "single unit",
+        "capacity": 50,
+        "power_kw": 4,
+        "compatible_processes": ["step_z"]
+      }
+    ]
+  },
+  "energy": {
+    "solar_profile": {
+      "0": 0, "1": 0, "2": 0, "3": 0, "4": 0, "5": 3,
+      "6": 8, "7": 14, "8": 20, "9": 24, "10": 18, "11": 10
+    },
+    "tariff_profile": {
+      "0": 0.45, "1": 0.45, "2": 0.45, "3": 0.42, "4": 0.38, "5": 0.30,
+      "6": 0.20, "7": 0.12, "8": 0.08, "9": 0.06, "10": 0.09, "11": 0.15
+    },
+    "grid_emission_factor": 0.35
+  }
+}

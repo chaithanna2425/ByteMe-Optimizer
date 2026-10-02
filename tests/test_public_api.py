@@ -1,0 +1,528 @@
+"""
+ByteMe Public API Integration Tests (DEMO/SIMULATED DATA ONLY)
+
+Tests the PUBLIC ENTRY POINT optimize() rather than internal functions:
+all registered factories, Widget Lab, custom factories and energy profiles,
+the full error taxonomy, contract stability, and JSON round trips.
+"""
+
+import copy
+import json
+import os
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from optimizer import public_api
+from optimizer.factory_data import AVAILABLE_FACTORIES
+from optimizer.public_api import (
+    STATUS_ERROR,
+    STATUS_FEASIBLE,
+    STATUS_INFEASIBLE,
+    STATUS_INVALID_INPUT,
+    STATUS_OPTIMAL,
+    STATUS_UNKNOWN,
+    OptimizerInputError,
+    optimize,
+)
+from optimizer.optimizer import SolverUnknownError
+
+try:
+    import jsonschema
+    _HAS_JSONSCHEMA = True
+except ImportError:  # optional dependency - contract still checked manually
+    _HAS_JSONSCHEMA = False
+
+
+VALID_WIDGET = {
+    "factory": {
+        "factory_name": "Demo Widget Lab",
+        "factory_type": "widgets",
+        # Deadline 16 leaves room to shift y/z into the solar window 9-15
+        "planning_horizon_hours": 18,
+        "production_deadline": 16,
+        "processes": [
+            {"process_id": "step_x", "process_name": "Step X",
+             "duration_hours": 1, "power_kw": 10, "is_flexible": False,
+             "dependencies": [], "machine_id": "core"},
+            {"process_id": "step_y", "process_name": "Step Y",
+             "duration_hours": 1.5, "power_kw": 8, "is_flexible": True,
+             "dependencies": ["step_x"], "machine_id": "core"},
+            {"process_id": "step_z", "process_name": "Step Z",
+             "duration_hours": 1, "power_kw": 6, "is_flexible": True,
+             "dependencies": ["step_x"], "machine_id": "polisher"},
+        ],
+        "machines": [
+            {"machine_id": "core", "machine_name": "Shared Core",
+             "capacity": 1, "availability": "single unit",
+             "compatible_processes": ["step_x", "step_y"]},
+            {"machine_id": "polisher", "machine_name": "Polisher",
+             "capacity": 1, "availability": "single unit",
+             "compatible_processes": ["step_z"]},
+        ],
+    },
+    "energy": {
+        "solar_profile": {h: (12 if 9 <= h <= 15 else 0) for h in range(24)},
+        "tariff_profile": {h: (0.08 if 9 <= h <= 15 else 0.45) for h in range(24)},
+        "grid_emission_factor": 0.4,
+    },
+}
+
+
+def registered_factory_input(key):
+    """Wrap a registered demo factory config in the user-input envelope."""
+    from optimizer.app import review_input
+    from optimizer.input_layer import validate_user_input
+    config = validate_user_input({"factory": AVAILABLE_FACTORIES[key]})
+    return review_input(config)
+
+
+class OptimizeValidInputTests(unittest.TestCase):
+    """optimize() on valid factories: happy paths."""
+
+    def test_widget_lab_dict_input(self):
+        result = optimize(copy.deepcopy(VALID_WIDGET))
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        self.assertIsNone(result["errors"])
+        self.assertEqual(result["result"]["factory_name"], "Demo Widget Lab")
+        self.assertEqual(result["result"]["objective"], "cost")
+        for solve_time in (
+            result["result"]["solve_time_seconds"],
+            result["result"]["baseline"]["solve_time_seconds"],
+            result["result"]["optimized"]["solve_time_seconds"]):
+            self.assertIsInstance(solve_time, (int, float))
+            self.assertGreaterEqual(solve_time, 0)
+
+    def test_feasible_solver_status_keeps_wall_time(self):
+        from ortools.sat.python import cp_model
+        from optimizer.optimizer import _new_solver
+
+        real_new_solver = _new_solver
+
+        class FeasibleStatusSolver:
+            def __init__(self, max_time_seconds):
+                self.solver = real_new_solver(max_time_seconds)
+
+            def Solve(self, model):
+                status = self.solver.Solve(model)
+                return (cp_model.FEASIBLE if status == cp_model.OPTIMAL
+                        else status)
+
+            def __getattr__(self, name):
+                return getattr(self.solver, name)
+
+        with patch("optimizer.optimizer._new_solver",
+                   side_effect=FeasibleStatusSolver):
+            result = optimize(copy.deepcopy(VALID_WIDGET))
+
+        self.assertEqual(result["status"], STATUS_FEASIBLE)
+        for schedule in (result["result"]["baseline"],
+                         result["result"]["optimized"]):
+            self.assertEqual(schedule["status"], STATUS_FEASIBLE)
+            self.assertIsInstance(schedule["solve_time_seconds"], (int, float))
+            self.assertGreaterEqual(schedule["solve_time_seconds"], 0)
+        self.assertGreaterEqual(result["result"]["solve_time_seconds"], 0)
+
+    def test_all_seven_registered_factories(self):
+        for key in AVAILABLE_FACTORIES:
+            with self.subTest(factory=key):
+                result = optimize(registered_factory_input(key))
+                self.assertEqual(result["status"], STATUS_OPTIMAL, msg=key)
+                payload = result["result"]
+                self.assertIsNotNone(payload["baseline"], msg=key)
+                self.assertIsNotNone(payload["optimized"], msg=key)
+                self.assertEqual(
+                    len(payload["optimized"]["processes"]),
+                    len(payload["baseline"]["processes"]), msg=key,
+                )
+
+    def test_widget_lab_from_json_string_and_file(self):
+        as_json = json.dumps(VALID_WIDGET)
+        self.assertEqual(optimize(as_json)["status"], STATUS_OPTIMAL)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(VALID_WIDGET, fh)
+            path = fh.name
+        try:
+            self.assertEqual(optimize(path)["status"], STATUS_OPTIMAL)
+        finally:
+            os.unlink(path)
+
+    def test_custom_energy_profile(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["energy"]["solar_profile"] = {h: 50 for h in range(24)}   # always sun
+        data["energy"]["tariff_profile"] = {h: 0.05 for h in range(24)}  # flat cheap
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        # constant sun: optimized schedule runs fully on solar
+        self.assertGreater(result["result"]["optimized"]["energy"]["solar_kwh"], 0)
+
+    def test_solar_objective_option(self):
+        result = optimize(copy.deepcopy(VALID_WIDGET), objective="solar")
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        self.assertEqual(result["result"]["objective"], "solar")
+
+    def test_objective_option_in_input(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["options"] = {"objective": "solar"}
+        result = optimize(data)
+        self.assertEqual(result["result"]["objective"], "solar")
+
+    def test_optional_carbon_present_and_absent(self):
+        with_carbon = optimize(copy.deepcopy(VALID_WIDGET))
+        self.assertIsNotNone(with_carbon["result"]["carbon"])
+        self.assertGreater(with_carbon["result"]["carbon"]["co2_reduction_kg"], 0)
+
+        without = copy.deepcopy(VALID_WIDGET)
+        without["energy"].pop("grid_emission_factor")
+        result = optimize(without)
+        self.assertIsNone(result["result"]["carbon"])
+
+    def test_baseline_optimized_consistency(self):
+        result = optimize(copy.deepcopy(VALID_WIDGET))["result"]
+        same_ids = (
+            [p["process_id"] for p in result["baseline"]["processes"]]
+            == [p["process_id"] for p in result["optimized"]["processes"]]
+        )
+        self.assertTrue(same_ids)
+        # total energy is identical (power x duration is schedule-invariant)
+        self.assertAlmostEqual(
+            result["baseline"]["energy"]["total_kwh"],
+            result["optimized"]["energy"]["total_kwh"], places=6,
+        )
+        # optimized never costs more
+        self.assertLessEqual(
+            result["comparison"]["cost_optimized"],
+            result["comparison"]["cost_baseline"] + 1e-6,
+        )
+        # energy identity per row: solar + grid = power x duration
+        for row in result["optimized"]["processes"]:
+            self.assertAlmostEqual(
+                row["solar_kwh"] + row["grid_kwh"],
+                row["power_kw"] * row["duration_hours"], places=6,
+            )
+
+    def test_json_serialization_round_trip(self):
+        result = optimize(copy.deepcopy(VALID_WIDGET))
+        text = json.dumps(result)
+        restored = json.loads(text)
+        self.assertEqual(restored["status"], STATUS_OPTIMAL)
+        self.assertEqual(
+            restored["result"]["comparison"]["cost_savings"],
+            result["result"]["comparison"]["cost_savings"],
+        )
+
+
+class OptimizeInvalidInputTests(unittest.TestCase):
+    """optimize() error handling: every failure mode returns a clean result."""
+
+    def test_invalid_schema_missing_factory(self):
+        result = optimize({"energy": {}})
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(result["errors"])
+        self.assertIsNone(result["result"])
+
+    def test_invalid_dependency(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["factory"]["processes"][1]["dependencies"].append("ghost")
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("invalid dependency" in e for e in result["errors"]))
+
+    def test_circular_dependency(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["factory"]["processes"][0]["dependencies"].append("step_y")
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("circular dependency" in e for e in result["errors"]))
+
+    def test_duplicate_process_ids(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["factory"]["processes"][1]["process_id"] = "step_x"
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("duplicate" in e for e in result["errors"]))
+
+    def test_invalid_machine_assignment(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["factory"]["processes"][0]["machine_id"] = "ghost_machine"
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("machine" in e for e in result["errors"]))
+
+    def test_impossible_deadline(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["factory"]["production_deadline"] = 1   # chain needs 2.5 h
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("time window" in e or "cannot fit" in e
+                            for e in result["errors"]))
+
+    def test_infeasible_optimization(self):
+        # Every process is individually valid; the dependency chain cannot
+        # finish by the shared deadline -> solver reports INFEASIBLE.
+        data = copy.deepcopy(VALID_WIDGET)
+        data["factory"]["production_deadline"] = 2
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INFEASIBLE)
+        self.assertIsNone(result["result"]["optimized"])
+        self.assertIsInstance(result["result"]["solve_time_seconds"], (int, float))
+        self.assertGreaterEqual(result["result"]["solve_time_seconds"], 0)
+        self.assertIsNone(result["errors"])
+
+    def test_operational_warnings_match_their_conditions(self):
+        flat = copy.deepcopy(VALID_WIDGET)
+        for process in flat["factory"]["processes"]:
+            process["is_flexible"] = False
+        flat["energy"]["tariff_profile"] = {hour: 0.25 for hour in range(24)}
+        warnings = optimize(flat)["warnings"]
+        self.assertTrue(any("all processes are marked non-flexible" in w
+                            for w in warnings))
+        self.assertTrue(any("uniform across the planning horizon" in w
+                            for w in warnings))
+
+        partly_flexible = copy.deepcopy(flat)
+        partly_flexible["factory"]["processes"][0]["is_flexible"] = True
+        warnings = optimize(partly_flexible)["warnings"]
+        self.assertFalse(any("all processes are marked non-flexible" in w
+                             for w in warnings))
+        self.assertTrue(any("uniform across the planning horizon" in w
+                            for w in warnings))
+
+        warnings = optimize(VALID_WIDGET, objective="solar")["warnings"]
+        self.assertFalse(any("uniform across the planning horizon" in w
+                             for w in warnings))
+        warnings = optimize(VALID_WIDGET)["warnings"]
+        self.assertFalse(any("uniform across the planning horizon" in w
+                             for w in warnings))
+
+    def test_operational_warnings_survive_unknown_solver_status(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        for process in data["factory"]["processes"]:
+            process["is_flexible"] = False
+        data["energy"]["tariff_profile"] = {hour: 0.25 for hour in range(24)}
+        with patch(
+                "optimizer.public_api.create_baseline_schedule",
+                side_effect=SolverUnknownError("test limit", 0.125)):
+            result = optimize(data)
+        self.assertEqual(result["status"], STATUS_UNKNOWN)
+        self.assertEqual(result["result"]["solve_time_seconds"], 0.125)
+        self.assertTrue(any("all processes are marked non-flexible" in w
+                            for w in result["warnings"]))
+        self.assertTrue(any("uniform across the planning horizon" in w
+                            for w in result["warnings"]))
+
+    def test_earliest_start_rounds_up_to_the_half_hour_grid(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        process = data["factory"]["processes"][0]
+        process["duration_hours"] = 0.5
+        process["earliest_start"] = 1.25
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        for schedule_name in ("baseline", "optimized"):
+            row = next(p for p in result["result"][schedule_name]["processes"]
+                       if p["process_id"] == "step_x")
+            self.assertGreaterEqual(row["start_time"], 1.25)
+            self.assertEqual(row["start_time"], 1.5)
+
+    def test_latest_finish_rounds_down_to_the_half_hour_grid(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        process = data["factory"]["processes"][0]
+        process["duration_hours"] = 0.5
+        process["earliest_start"] = 0.5
+        process["latest_finish"] = 1.25
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        for schedule_name in ("baseline", "optimized"):
+            row = next(p for p in result["result"][schedule_name]["processes"]
+                       if p["process_id"] == "step_x")
+            self.assertEqual(row["end_time"], 1.0)
+
+    def test_fractional_horizon_includes_final_partial_hour_cost(self):
+        data = {
+            "factory": {
+                "factory_name": "Fractional Horizon Probe",
+                "planning_horizon_hours": 2.5,
+                "production_deadline": 2.5,
+                "processes": [{
+                    "process_id": "p", "duration_hours": 1,
+                    "power_kw": 10, "dependencies": [],
+                    "is_flexible": True,
+                }],
+            },
+            "energy": {
+                "solar_profile": {hour: 0 for hour in range(24)},
+                "tariff_profile": {
+                    hour: (1000 if hour == 0 else
+                           10 if hour == 1 else
+                           100 if hour == 2 else 0)
+                    for hour in range(24)
+                },
+            },
+        }
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        row = result["result"]["optimized"]["processes"][0]
+        self.assertEqual(row["start_time"], 1.0)
+        self.assertAlmostEqual(
+            result["result"]["comparison"]["cost_optimized"], 100.0
+        )
+
+    def test_unrepresentable_energy_coefficients_are_rejected(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["factory"]["processes"][0]["power_kw"] = 0.1
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("power_kw" in error for error in result["errors"]))
+
+        data = copy.deepcopy(VALID_WIDGET)
+        data["energy"]["tariff_profile"][0] = 0.0004
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("tariff_profile" in error
+                            for error in result["errors"]))
+
+        data = copy.deepcopy(VALID_WIDGET)
+        data["energy"]["solar_profile"] = {hour: 0.1 for hour in range(24)}
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("solar_profile" in error
+                            for error in result["errors"]))
+
+    def test_small_representable_energy_coefficients_optimize_correctly(self):
+        data = {
+            "factory": {
+                "factory_name": "Small Exact Coefficients",
+                "planning_horizon_hours": 3,
+                "production_deadline": 3,
+                "processes": [{
+                    "process_id": "p", "duration_hours": 0.5,
+                    "power_kw": 0.2, "dependencies": [],
+                    "is_flexible": True,
+                }],
+            },
+            "energy": {
+                "solar_profile": {hour: 0 for hour in range(24)},
+                "tariff_profile": {
+                    hour: (0.01 if hour == 0 else 0.001)
+                    for hour in range(24)
+                },
+            },
+        }
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        row = result["result"]["optimized"]["processes"][0]
+        self.assertGreaterEqual(row["start_time"], 1.0)
+        self.assertAlmostEqual(row["energy_cost"], 0.0001, places=9)
+
+    def test_invalid_objective_is_invalid_input(self):
+        for source, objective in (
+                (copy.deepcopy(VALID_WIDGET), "banana"),
+                ({**copy.deepcopy(VALID_WIDGET),
+                 "options": {"objective": "banana"}}, "cost")):
+            with self.subTest(objective=objective, options=source.get("options")):
+                result = optimize(source, objective=objective)
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                self.assertIsNone(result["result"])
+                self.assertTrue(any("objective" in error.lower()
+                                    for error in result["errors"]))
+
+    def test_malformed_json_string(self):
+        result = optimize("{not valid json")
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("Could not read input" in e for e in result["errors"]))
+
+    def test_missing_file(self):
+        result = optimize("definitely_missing_file_12345.json")
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("Could not read input" in e for e in result["errors"]))
+
+    def test_unsupported_source_type(self):
+        result = optimize(12345)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+
+    def test_no_stack_traces_in_result(self):
+        result = optimize("{broken json")
+        text = json.dumps(result)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn(".py\"", text)
+
+    def test_strict_mode_raises(self):
+        with self.assertRaises(OptimizerInputError):
+            optimize("{broken", strict=True)
+
+
+class ContractStabilityTests(unittest.TestCase):
+    """The public contract must be stable and machine-checkable."""
+
+    def test_result_envelope_shape(self):
+        result = optimize(copy.deepcopy(VALID_WIDGET))
+        self.assertEqual(
+            set(result.keys()),
+            {"api_version", "status", "result", "errors", "warnings"},
+        )
+        self.assertIsInstance(result["warnings"], list)
+        self.assertEqual(result["api_version"], "1.0")
+        payload = result["result"]
+        for key in ("status", "factory_name", "objective", "baseline",
+                    "optimized", "comparison", "machine_utilization",
+                    "carbon", "validation_errors"):
+            self.assertIn(key, payload)
+        for key in ("makespan_baseline_hours", "cost_baseline", "cost_optimized",
+                    "cost_savings", "cost_saving_percent",
+                    "solar_utilization_percent", "shifted_processes"):
+            self.assertIn(key, payload["comparison"])
+        for key in ("status", "makespan_hours", "processes", "energy"):
+            self.assertIn(key, payload["optimized"])
+        for key in ("total_kwh", "solar_kwh", "grid_kwh"):
+            self.assertIn(key, payload["optimized"]["energy"])
+        row = payload["optimized"]["processes"][0]
+        for key in ("process_id", "start_time", "end_time", "duration_hours",
+                    "power_kw", "is_flexible", "machine_id", "solar_kwh",
+                    "grid_kwh", "energy_cost", "tariff"):
+            self.assertIn(key, row)
+
+    def test_schema_accessors(self):
+        input_schema = public_api.get_input_schema()
+        output_schema = public_api.get_output_schema()
+        self.assertIn("factory", input_schema["properties"])
+        self.assertIn("energy", input_schema["properties"])
+        self.assertIn("options", input_schema["properties"])
+        self.assertEqual(
+            set(output_schema["properties"]["status"]["enum"]),
+            {STATUS_OPTIMAL, STATUS_FEASIBLE, STATUS_INFEASIBLE,
+             STATUS_UNKNOWN, STATUS_INVALID_INPUT, STATUS_ERROR},
+        )
+
+    def test_output_validates_against_json_schema(self):
+        result = optimize(copy.deepcopy(VALID_WIDGET))
+        if _HAS_JSONSCHEMA:
+            jsonschema.validate(result, public_api.get_output_schema())
+        else:
+            # Fallback structural check when jsonschema is not installed
+            self.assertIn(result["status"],
+                          public_api.get_output_schema()
+                          ["properties"]["status"]["enum"])
+
+    def test_invalid_input_validates_against_json_schema(self):
+        result = optimize({"factory": {"factory_name": "Broken"}})
+        if _HAS_JSONSCHEMA:
+            jsonschema.validate(result, public_api.get_output_schema())
+
+    def test_input_schema_accepts_widget_lab(self):
+        if _HAS_JSONSCHEMA:
+            jsonschema.validate(
+                copy.deepcopy(VALID_WIDGET), public_api.get_input_schema()
+            )
+
+    def test_engine_stays_agnostic(self):
+        import inspect
+        from optimizer import optimizer as engine
+        source = inspect.getsource(engine).lower()
+        for term in ("chocolate", "cosmetic", "beverage", "pharma",
+                     "automotive", "furniture", "widget", "food"):
+            self.assertNotIn(term, source, msg=f"engine mentions {term!r}")
+
+
+if __name__ == "__main__":
+    unittest.main()
