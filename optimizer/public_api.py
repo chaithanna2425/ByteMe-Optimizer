@@ -63,9 +63,10 @@ class _PipelineUnknown(Exception):
     validated config's warnings and recorded solve time so entry points can
     surface them."""
 
-    def __init__(self, warnings, solve_time_seconds=None):
+    def __init__(self, warnings, solve_time_seconds=None, baseline_schedule=None):
         self.warnings = list(warnings)
         self.solve_time_seconds = solve_time_seconds
+        self.baseline_schedule = baseline_schedule
         super().__init__("solver limit hit without a proven result")
 
 
@@ -107,6 +108,8 @@ def _project_process_rows(schedule):
             "power_kw": p["power_kw"],
             "is_flexible": p["is_flexible"],
             "machine_id": p.get("machine_id"),
+            "capacity_units": p.get("capacity_units", 1),
+            "machine_capacity": p.get("machine_capacity"),
             "quantity": p.get("quantity"),
             "solar_kwh": p["solar_energy_kwh"],
             "grid_kwh": p["grid_energy_kwh"],
@@ -274,7 +277,15 @@ def _run_pipeline(source, objective, include_infeasible_time=False):
             if (base_t is not None and opt_t is not None)
             else (base_t or opt_t)
         )
-        raise _PipelineUnknown(getattr(config, "warnings", []), tot_t)
+        unknown_warnings = list(getattr(config, "warnings", []))
+        if baseline is not None and baseline["status"] != STATUS_OPTIMAL:
+            unknown_warnings.append(
+                "baseline schedule is FEASIBLE (time limit reached before "
+                "optimality could be proven)"
+            )
+        raise _PipelineUnknown(
+            unknown_warnings, tot_t, baseline
+        )
     except SolverInfeasibleError as err:
         if include_infeasible_time:
             return config, baseline, None, err.solve_time_seconds
@@ -284,24 +295,40 @@ def _run_pipeline(source, objective, include_infeasible_time=False):
     return config, baseline, optimized
 
 
-def _unknown_result(factory_name, objective, warnings, solve_time_seconds=None):
+def _unknown_result(factory_name, objective, warnings, solve_time_seconds=None,
+                    baseline_schedule=None):
     """UNKNOWN status: solver limit hit, infeasibility NOT proven."""
+    if baseline_schedule is None:
+        solver_warning = (
+            "solver hit its time limit without finding a feasible schedule "
+            "and without proving infeasibility; retry with a larger "
+            "options.max_time_seconds or simplify the problem"
+        )
+        baseline = None
+        machine_utilization = None
+    else:
+        from optimizer.app import machine_utilization as calculate_machine_utilization
+        solver_warning = (
+            "optimized solver hit its time limit without producing an "
+            "optimized schedule; the successful baseline schedule is available"
+        )
+        baseline = _project_schedule(baseline_schedule)
+        machine_utilization = {
+            "baseline": calculate_machine_utilization(baseline_schedule),
+            "optimized": None,
+        }
     return _ok_result({
         "status": STATUS_UNKNOWN,
         "factory_name": factory_name,
         "objective": objective,
         "solve_time_seconds": solve_time_seconds,
-        "baseline": None,
+        "baseline": baseline,
         "optimized": None,
         "comparison": None,
         "carbon": None,
-        "machine_utilization": None,
+        "machine_utilization": machine_utilization,
         "validation_errors": None,
-        "warnings": list(warnings) + [
-            "solver hit its time limit without finding a feasible schedule "
-            "and without proving infeasibility; retry with a larger "
-            "options.max_time_seconds or simplify the problem",
-        ],
+        "warnings": list(warnings) + [solver_warning],
     })
 
 
@@ -468,6 +495,7 @@ def optimize(source, objective="cost", strict=False):
         return _unknown_result(
             _factory_name(source), objective, exc.warnings,
             getattr(exc, "solve_time_seconds", None),
+            getattr(exc, "baseline_schedule", None),
         )
 
     except OptimizerInputError:

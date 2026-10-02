@@ -37,7 +37,7 @@ SHARED_VOCABULARY = {
     "dependencies", "is_flexible", "machine_id", "capacity_units", "earliest_start",
     "latest_finish",
     # input: machine
-    "machine_name", "capacity", "availability", "power_kw",
+    "machine_name", "capacity", "machine_capacity", "availability", "power_kw",
     "compatible_processes",
     # input: energy + options
     "solar_profile", "tariff_profile", "grid_emission_factor", "objective",
@@ -59,7 +59,9 @@ SHARED_VOCABULARY = {
     "start_time", "end_time", "solar_kwh", "grid_kwh", "energy_cost",
     "tariff",
     # machine utilization entries
-    "busy_hours", "utilization_percent",
+    "busy_hours", "capacity_unit_hours", "peak_capacity_units",
+    "anyOf", "maximum",
+    "utilization_percent",
     # carbon block
     "grid_emission_factor_kg_per_kwh", "baseline_co2_kg", "optimized_co2_kg",
     "co2_reduction_kg", "co2_reduction_percent",
@@ -258,6 +260,15 @@ class DocsSchemaConsistencyTests(unittest.TestCase):
                      "start_time", "end_time", "tariff"):
             self.assertIn(term, doc, msg=f"API.md missing term: {term}")
 
+    def test_energy_time_contract_is_explicit(self):
+        with open("optimizer/API.md", encoding="utf-8") as handle:
+            doc = " ".join(handle.read().lower().split())
+        for term in ("Time 0", "timezone", "daylight-saving",
+                     "currency", "half-hour", "final hourly bucket",
+                     "shared, site-wide hourly pool", "[h, h + 1)"):
+            self.assertIn(term.lower(), doc,
+                          msg=f"API.md missing energy/time contract term: {term}")
+
     def test_input_schema_property_names_match_vocabulary(self):
         schema = public_api.get_input_schema()
         keys = _walk_keys(schema)
@@ -268,8 +279,10 @@ class DocsSchemaConsistencyTests(unittest.TestCase):
             and k not in {"type", "description", "items", "properties",
                           "required", "enum", "minimum", "exclusiveMinimum",
                           "additionalProperties", "minLength", "minItems",
+                          "minProperties",
                           "multipleOf",
                           "integer",
+                          "propertyNames", "pattern",
                           "title", "definitions", "$ref", "$schema", "number",
                           "object", "array", "string", "boolean", "null"}
         }

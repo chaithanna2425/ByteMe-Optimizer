@@ -353,6 +353,49 @@ class PropertyInvariantTests(unittest.TestCase):
 class AdversarialInputTests(unittest.TestCase):
     """Extreme-but-valid inputs succeed; invalid inputs fail clearly."""
 
+    def test_large_dependency_chain_is_iterative_and_order_independent(self):
+        count = 1200
+        ordered = [
+            {"process_id": f"p{i}", "duration_hours": 0.5,
+             "power_kw": 1,
+             "dependencies": [f"p{i + 1}"] if i + 1 < count else []}
+            for i in range(count)
+        ]
+        for processes in (ordered, list(reversed(ordered))):
+            with self.subTest(reverse=processes[0]["process_id"] != "p0"):
+                config = validate_user_input({
+                    "factory": {
+                        "factory_name": "Large Dependency Chain",
+                        "planning_horizon_hours": count / 2,
+                        "production_deadline": count / 2,
+                        "processes": copy.deepcopy(processes),
+                    },
+                })
+                self.assertEqual(len(config.processes), count)
+
+    def test_dependency_validation_handles_branch_merge_and_disconnected_nodes(self):
+        processes = [
+            {"process_id": "merge", "duration_hours": 0.5,
+             "power_kw": 1, "dependencies": ["left", "right"]},
+            {"process_id": "isolated", "duration_hours": 0.5,
+             "power_kw": 1, "dependencies": []},
+            {"process_id": "right", "duration_hours": 0.5,
+             "power_kw": 1, "dependencies": ["root"]},
+            {"process_id": "left", "duration_hours": 0.5,
+             "power_kw": 1, "dependencies": ["root"]},
+            {"process_id": "root", "duration_hours": 0.5,
+             "power_kw": 1, "dependencies": []},
+        ]
+        config = validate_user_input({
+            "factory": {
+                "factory_name": "Branch Merge Graph",
+                "planning_horizon_hours": 4,
+                "production_deadline": 4,
+                "processes": processes,
+            },
+        })
+        self.assertEqual(len(config.processes), len(processes))
+
     def test_extremely_large_but_valid_values(self):
         # Large-but-representable values must produce finite, consistent math.
         # (Feasibility bound: power_kw x tariff x duration_hours x 1000 must

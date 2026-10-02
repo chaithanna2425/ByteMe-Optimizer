@@ -56,7 +56,11 @@ INPUT_SCHEMA = {
                                 "power_kw x tariff_per_kwh x "
                                 "duration_hours must stay <= 100000 (per "
                                 "process), else INVALID INPUT."},
-                            "quantity": {"type": ["number", "null"]},
+                            "quantity": {
+                                "type": ["number", "null"],
+                                "description": "Informational only; does not "
+                                               "change duration, power, or demand",
+                            },
                             "dependencies": {
                                 "type": "array",
                                 "items": {"type": "string"},
@@ -90,10 +94,26 @@ INPUT_SCHEMA = {
                         "properties": {
                             "machine_id": {"type": "string", "minLength": 1},
                             "machine_name": {"type": "string"},
-                            "availability": {"type": "string"},
-                            "capacity": {"type": ["number", "null"]},
-                            "power_kw": {"type": ["number", "null"]},
+                            "availability": {
+                                "type": "string",
+                                "description": "Informational only; not enforced "
+                                               "as a calendar or shift",
+                            },
+                            "capacity": {
+                                "type": ["number", "null"],
+                                "minimum": 1,
+                                "multipleOf": 1,
+                                "description": "Maximum simultaneous capacity "
+                                               "units; null defaults to 1",
+                            },
+                            "power_kw": {
+                                "type": ["number", "null"],
+                                "description": "Informational only; process "
+                                               "power_kw drives energy calculations",
+                            },
                             "compatible_processes": {
+                                "description": "Informational only; assignment "
+                                               "mismatches warn but are not prohibited",
                                 "type": "array", "items": {"type": "string"},
                             },
                         },
@@ -110,6 +130,11 @@ INPUT_SCHEMA = {
             "properties": {
                 "solar_profile": {
                     "type": "object",
+                    "minProperties": 1,
+                    "propertyNames": {
+                        "type": "string",
+                        "pattern": r"^\s*0*(?:[0-9]|1[0-9]|2[0-3])\s*$",
+                    },
                     "description": "hour (0-23, int or numeric string) -> "
                                    "kW in 0.2 increments",
                     "additionalProperties": {
@@ -118,6 +143,11 @@ INPUT_SCHEMA = {
                 },
                 "tariff_profile": {
                     "type": "object",
+                    "minProperties": 1,
+                    "propertyNames": {
+                        "type": "string",
+                        "pattern": r"^\s*0*(?:[0-9]|1[0-9]|2[0-3])\s*$",
+                    },
                     "description": "hour (0-23, int or numeric string) -> "
                                    "currency/kWh in 0.001 increments",
                     "additionalProperties": {
@@ -204,8 +234,13 @@ OUTPUT_SCHEMA = {
                 "machine_utilization": {
                     "type": ["object", "null"],
                     "properties": {
-                        "baseline": {"type": "object"},
-                        "optimized": {"type": "object"},
+                        "baseline": {"$ref": "#/definitions/machine_utilization"},
+                        "optimized": {
+                            "anyOf": [
+                                {"$ref": "#/definitions/machine_utilization"},
+                                {"type": "null"},
+                            ],
+                        },
                     },
                 },
                 "carbon": {
@@ -249,6 +284,7 @@ OUTPUT_SCHEMA = {
                         "required": [
                             "process_id", "start_time", "end_time",
                             "duration_hours", "is_flexible",
+                            "capacity_units", "machine_capacity",
                             "solar_kwh", "grid_kwh", "energy_cost",
                         ],
                         "properties": {
@@ -260,6 +296,8 @@ OUTPUT_SCHEMA = {
                             "power_kw": {"type": "number"},
                             "is_flexible": {"type": "boolean"},
                             "machine_id": {"type": ["string", "null"]},
+                            "capacity_units": {"type": "integer", "minimum": 1},
+                            "machine_capacity": {"type": ["integer", "null"]},
                             "quantity": {},
                             "solar_kwh": {"type": "number"},
                             "grid_kwh": {"type": "number"},
@@ -275,6 +313,25 @@ OUTPUT_SCHEMA = {
                         "total_kwh": {"type": "number"},
                         "solar_kwh": {"type": "number"},
                         "grid_kwh": {"type": "number"},
+                    },
+                },
+            },
+        },
+        "machine_utilization": {
+            "type": ["object", "null"],
+            "additionalProperties": {
+                "type": "object",
+                "required": [
+                    "busy_hours", "capacity_unit_hours", "capacity",
+                    "peak_capacity_units", "utilization_percent",
+                ],
+                "properties": {
+                    "busy_hours": {"type": "number"},
+                    "capacity_unit_hours": {"type": "number"},
+                    "capacity": {"type": "integer", "minimum": 1},
+                    "peak_capacity_units": {"type": "integer", "minimum": 0},
+                    "utilization_percent": {
+                        "type": "number", "minimum": 0, "maximum": 100,
                     },
                 },
             },

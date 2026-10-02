@@ -1,5 +1,4 @@
 {
-  "_comment": "ByteMe user-input example (DEMO/SIMULATED DATA - NOT REAL INDUSTRIAL DATA). Add an eighth factory by providing a file like this - no Python or optimizer changes required.",
   "factory": {
     "factory_name": "Demo Widget Lab",
     "factory_type": "widgets",

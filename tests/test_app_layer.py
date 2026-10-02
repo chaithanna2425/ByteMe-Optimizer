@@ -21,6 +21,7 @@ from optimizer.input_layer import (
     validate_user_input,
 )
 from optimizer.models import FactoryConfig
+from optimizer.optimizer import SolverUnknownError
 from optimizer.visualization import (
     render_energy_comparison,
     render_energy_profile,
@@ -276,6 +277,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["status"], app.STATUS_INVALID_INPUT)
         self.assertTrue(any("objective" in error.lower()
                             for error in result["validation_errors"]))
+
+    def test_workflow_unknown_keeps_successful_baseline(self):
+        from unittest.mock import patch
+
+        with patch(
+                "optimizer.public_api.create_cost_optimized_schedule",
+                side_effect=SolverUnknownError("test limit", 0.25)):
+            result = app.run_workflow(copy.deepcopy(VALID_INPUT))
+
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertEqual(result["baseline"]["status"], "OPTIMAL")
+        self.assertIsNone(result["optimized"])
+        self.assertGreater(result["solve_time_seconds"], 0.25)
+        self.assertTrue(any("optimized solver hit its time limit" in warning
+                    for warning in result["warnings"]))
 
     def test_select_factory_registry(self):
         names = app.list_factories()

@@ -58,7 +58,7 @@ A factory is pure data following the generic schema:
       "process_name": "Step X",
       "duration_hours": 1,               # multiple of 0.5 h (scheduling grid)
       "power_kw": 10,                    # constant power while running
-      "quantity": 100,                   # optional batch/quantity info
+      "quantity": 100,                   # informational only; not optimized
       "dependencies": [],                # process_ids that must finish first
       "is_flexible": false,              # False = pinned to baseline start
       "machine_id": "core",              # optional machine requirement
@@ -71,10 +71,10 @@ A factory is pure data following the generic schema:
     {
       "machine_id": "core",
       "machine_name": "Shared Core Machine",
-      "availability": "single unit",
       "capacity": 100,
-      "power_kw": 12,
-      "compatible_processes": ["step_x", "step_y"]
+      "power_kw": 12,                    # informational only
+      "availability": "single unit",     # informational only; not a calendar
+      "compatible_processes": ["step_x", "step_y"] # informational only
     }
   ]
 }
@@ -167,6 +167,15 @@ cost per slot         = grid × tariff[hour]      (solar never billed)
 Guarantees: `solar + grid = total`, no negative values, and the in-model
 objective uses exactly these definitions (verified by tests against an
 independent recomputation).
+
+All schedule times are relative to planning time 0 and use half-hour ticks.
+Hourly solar/tariff profile keys refer to elapsed hours from that origin and
+repeat every 24 hours for longer horizons. The final bucket is clipped to
+the effective horizon, including a half-hour final interval. The optimizer
+does not convert time zones or daylight-saving transitions; timestamped
+profiles must be mapped to planning-relative hours by an integration layer.
+Tariff values use one caller-selected currency unit per kWh; power is kW,
+energy is kWh, and carbon factors are kg CO2/kWh.
 
 ## 7. Carbon calculation (optional)
 

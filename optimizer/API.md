@@ -114,18 +114,22 @@ Field semantics:
 
 | Field | Meaning |
 |---|---|
-| `planning_horizon_hours` | scheduling window; effective limit rounds down to the last half-hour tick, and energy buckets cover every hour touched by that grid-aligned horizon |
-| `production_deadline` | hard completion deadline for all processes; effective limit rounds down to the last half-hour tick |
-| `duration_hours` | operating duration; must be a multiple of 0.5 |
-| `power_kw` | constant power draw while running; must be a multiple of 0.2 kW so each half-hour demand is exactly representable as 0.1 kWh; integer-scaling bound: `power_kw x tariff_per_kwh x duration_hours <= 100000` per process |
+| `planning_horizon_hours` | scheduling window relative to time 0; effective limit rounds down to the last half-hour tick, and the final energy bucket is clipped to the actual horizon |
+| `production_deadline` | hard completion deadline relative to time 0; effective limit rounds down to the last half-hour tick |
+| `duration_hours` | operating duration in hours; must be a multiple of 0.5 |
+| `power_kw` | constant process power while running, in kW; must be a multiple of 0.2 kW so each half-hour demand is exactly representable as 0.1 kWh |
 | `quantity` | informational batch/production quantity |
 | `dependencies` | process_ids that must finish before this starts; acyclic |
 | `is_flexible` | `true` = optimizer may shift; `false` = pinned to baseline start |
 | `machine_id` | machine requirement; processes sharing a machine never overlap |
 | `capacity_units` | optional positive integer demand on the assigned machine; defaults to 1 and must not exceed machine capacity |
-| `earliest_start` / `latest_finish` | optional per-process time window (hours); earliest start rounds up and latest finish rounds down to the half-hour grid |
-| `energy.solar_profile` | hour (0–23, int or numeric string) → available kW in 0.2 kW increments; cyclically repeated for horizons > 24 h |
-| `energy.tariff_profile` | hour (0–23) → currency per kWh in 0.001 increments (DEMO values only if omitted) |
+| `machines[].capacity` | enforced maximum simultaneous capacity units; each assigned process consumes its `capacity_units` |
+| `machines[].power_kw` | informational only; energy uses each process's `power_kw` |
+| `machines[].availability` | informational only; no shift, calendar, or downtime constraint is applied |
+| `machines[].compatible_processes` | informational only; a mismatch warns but does not prohibit assignment |
+| `earliest_start` / `latest_finish` | optional per-process time window in hours relative to time 0; earliest start rounds up and latest finish rounds down to the half-hour grid |
+| `energy.solar_profile` | elapsed hour index (0–23, int or numeric string) → site-wide available solar power in kW, in 0.2 kW increments |
+| `energy.tariff_profile` | elapsed hour index (0–23, int or numeric string) → tariff per consumed grid kWh, in 0.001 currency-unit increments |
 | `energy.grid_emission_factor` | optional kg CO2/kWh; omit → carbon = `null` |
 | `options.objective` | `"cost"` or `"solar"` (optional; overrides argument) |
 | `options.max_time_seconds` | optional per-solve solver time limit (> 0); default 60 s per solve |
@@ -135,6 +139,31 @@ back to the DEMO profiles. Full machine-readable contract:
 `public_api.get_input_schema()` (also in `optimizer/schemas.py`).
 Energy coefficients outside these exact integer-scale resolutions return
 `INVALID INPUT`; they are never silently rounded into a different objective.
+Changing `quantity` does not change scheduling, duration, or energy.
+
+### Energy and Time Contract
+
+All schedule times are relative to the beginning of the planning horizon:
+time 0 is the planning origin, not a wall-clock timestamp. Start and end
+times are expressed in hours and lie on the 0.5-hour grid. An earliest-start
+bound rounds up to the next grid tick; a latest-finish, deadline, or horizon
+bound rounds down to the preceding grid tick. The energy model includes every
+hour touched by the effective horizon. If the final grid tick is at a
+half-hour boundary, the final hourly bucket contains only that actual
+half-hour of demand; no energy is charged beyond the scheduled interval.
+
+Profile key `h` applies to elapsed interval `[h, h + 1)` from the planning
+origin. For horizons longer than 24 hours, the demo profile repeats with
+`h % 24`. Solar values are available power in kW for one shared, site-wide
+hourly pool; the pool is clipped by each running process's constant kW draw
+and by its actual overlap with that hour. Solar is not stored or exported.
+Tariffs are currency units per kWh of grid energy consumed; the API does not
+select or convert a currency, so callers must use one consistent unit.
+Reported energy is kWh, process power is kW, and carbon factors are kg
+CO2/kWh. No timezone, daylight-saving, or wall-clock conversion is performed.
+An integration adapter must map timestamped external profiles into these
+planning-relative hourly buckets before calling the optimizer. These are
+model semantics, not a requirement to supply real external data today.
 
 ## 5. Output format (canonical schema)
 
@@ -181,7 +210,13 @@ Energy coefficients outside these exact integer-scale resolutions return
 
 Each schedule `processes` row contains exactly:
 `process_id, process_name, start_time, end_time, duration_hours, power_kw,
-is_flexible, machine_id, quantity, solar_kwh, grid_kwh, energy_cost, tariff`.
+is_flexible, machine_id, capacity_units, machine_capacity, quantity,
+solar_kwh, grid_kwh, energy_cost, tariff`.
+
+Machine utilization reports `busy_hours` (sum of process durations),
+`capacity_unit_hours`, declared `capacity`, `peak_capacity_units`, and
+capacity-normalized `utilization_percent`. Capacity-1 metrics retain their
+previous interpretation.
 
 Status values: `OPTIMAL` (proven best), `FEASIBLE` (valid, not proven
 best — a warning explains why), `INFEASIBLE` (constraints cannot all
@@ -189,6 +224,11 @@ hold), `UNKNOWN` (solver hit its time limit without finding a solution
 AND without proving infeasibility — never report as INFEASIBLE; retry
 with a larger `options.max_time_seconds`), `INVALID INPUT` (see
 `errors`), `ERROR` (internal failure; generic message, no stack trace).
+
+If baseline solving succeeds but optimization returns `UNKNOWN`, the result
+retains the baseline schedule and baseline machine utilization;
+`optimized` and optimized machine utilization are `null`. If baseline
+solving itself returns `UNKNOWN`, neither schedule is claimed.
 
 `solve_time_seconds` is measured from CP-SAT `WallTime()`. Baseline and
 optimized schedules report their individual solver times; the result-level

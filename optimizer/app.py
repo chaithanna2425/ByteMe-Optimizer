@@ -77,6 +77,7 @@ def review_input(factory_config):
                         "dependencies": list(p.dependencies),
                         "is_flexible": p.is_flexible,
                         "machine_id": p.machine_id,
+                        "capacity_units": p.capacity_units,
                         "earliest_start": p.earliest_start,
                         "latest_finish": p.latest_finish,
                     }
@@ -174,14 +175,27 @@ def run_workflow(factory_input, objective="cost"):
             "results": None,
             "validation_errors": list(exc.problems),
         }
-    except _PipelineUnknown:
+    except _PipelineUnknown as exc:
         # UNKNOWN: limit hit without a solution; infeasibility NOT proven.
-        # Legacy legacy-shaped result carries no schedules.
-        return {
+        result = {
             "status": "UNKNOWN",
             "results": None,
             "validation_errors": None,
         }
+        if exc.baseline_schedule is not None:
+            result["baseline"] = exc.baseline_schedule
+            result["optimized"] = None
+            result["solve_time_seconds"] = exc.solve_time_seconds
+            result["warnings"] = list(exc.warnings) + [
+                "optimized solver hit its time limit without producing an "
+                "optimized schedule; the successful baseline schedule is available"
+            ]
+        else:
+            result["warnings"] = list(exc.warnings) + [
+                "baseline solver hit its time limit without finding a feasible "
+                "schedule or proving infeasibility"
+            ]
+        return result
 
     if baseline is None or optimized is None:
         return {
@@ -216,25 +230,49 @@ def summarize_schedule(schedule):
 
 def machine_utilization(schedule):
     """
-    Machine utilization per machine: busy hours / makespan (or busy hours
-    alone when the schedule has no machines).
+    Capacity-weighted machine utilization and peak load over the makespan.
     """
-    busy = {}
+    usage = {}
     for process in schedule["processes"]:
         machine_id = process.get("machine_id")
         if machine_id is None:
             continue
         hours = process["end_time"] - process["start_time"]
-        busy[machine_id] = busy.get(machine_id, 0.0) + hours
+        demand = process.get("capacity_units", 1)
+        machine = usage.setdefault(machine_id, {
+            "busy_hours": 0.0,
+            "capacity_unit_hours": 0.0,
+            "capacity": process.get("machine_capacity", 1),
+            "events": [],
+        })
+        machine["busy_hours"] += hours
+        machine["capacity_unit_hours"] += demand * hours
+        machine["capacity"] = process.get(
+            "machine_capacity", machine["capacity"]
+        )
+        machine["events"].append((process["start_time"], demand))
+        machine["events"].append((process["end_time"], -demand))
 
     makespan = schedule["makespan"] or 1.0
-    return {
-        machine_id: {
-            "busy_hours": round(hours, 4),
-            "utilization_percent": round(hours / makespan * 100, 2),
+    results = {}
+    for machine_id, machine in sorted(usage.items()):
+        active = peak = 0
+        for _, change in sorted(machine["events"]):
+            active += change
+            peak = max(peak, active)
+        capacity = machine["capacity"] or 1
+        results[machine_id] = {
+            "busy_hours": round(machine["busy_hours"], 4),
+            "capacity_unit_hours": round(machine["capacity_unit_hours"], 4),
+            "capacity": capacity,
+            "peak_capacity_units": peak,
+            "utilization_percent": round(
+                machine["capacity_unit_hours"]
+                / (capacity * makespan) * 100,
+                2,
+            ),
         }
-        for machine_id, hours in sorted(busy.items())
-    }
+    return results
 
 
 def count_shifted_processes(baseline, optimized):

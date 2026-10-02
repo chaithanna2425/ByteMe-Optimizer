@@ -22,6 +22,7 @@ from optimizer.models import (
     FactoryConfigError,
     ProcessSpec,
     TIME_SCALE,
+    dependency_topological_order,
     energy_precision_problems,
     time_to_grid_ceil,
     time_to_grid_floor,
@@ -57,11 +58,12 @@ def _add_warning(warnings, message):
 
 def _is_finite_number(value):
     """True when value is a finite (non-NaN, non-infinite) real number."""
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
 
 
 def _normalize_profile_hours(profile):
@@ -168,8 +170,45 @@ def validate_user_input(data):
             "sections"
         ])
 
+    allowed_top_level = {"factory", "energy", "options"}
+    for key in data:
+        if key not in allowed_top_level:
+            _add_problem(problems, f"unknown top-level field {key!r}")
+
     factory = data.get("factory")
     energy = data.get("energy", {})
+    if not isinstance(energy, dict):
+        _add_problem(problems, "'energy' section must be an object")
+        energy = {}
+    else:
+        for key in energy:
+            if key not in {"solar_profile", "tariff_profile",
+                           "grid_emission_factor"}:
+                _add_problem(problems, f"unknown energy field {key!r}")
+
+    options = data.get("options", {})
+    if not isinstance(options, dict):
+        _add_problem(problems, "'options' section must be an object")
+        options = {}
+    else:
+        for key in options:
+            if key not in {"objective", "max_time_seconds"}:
+                _add_problem(problems, f"unknown option {key!r}")
+        if "objective" in options and options["objective"] not in ("cost", "solar"):
+            _add_problem(
+                problems,
+                "options.objective must be 'cost' or 'solar', "
+                f"got {options['objective']!r}",
+            )
+        if "max_time_seconds" in options:
+            limit = options["max_time_seconds"]
+            if (limit is not None
+                    and (not _is_finite_number(limit) or limit <= 0)):
+                _add_problem(
+                    problems,
+                    "options.max_time_seconds must be a positive finite "
+                    f"number or null, got {limit!r}",
+                )
 
     # ---- factory section ------------------------------------------------
     if not isinstance(factory, dict):
@@ -254,6 +293,22 @@ def validate_user_input(data):
             _add_problem(
                 problems, f"process '{pid or index}': dependencies must be a list"
             )
+        else:
+            for dependency in deps:
+                if not isinstance(dependency, str):
+                    _add_problem(
+                        problems,
+                        f"process '{pid or index}': dependency IDs must be strings, "
+                        f"got {dependency!r}",
+                    )
+
+        quantity = proc.get("quantity")
+        if quantity is not None and not _is_finite_number(quantity):
+            _add_problem(
+                problems,
+                f"process '{pid or index}': quantity must be a finite number "
+                f"or null, got {quantity!r}",
+            )
 
         if "is_flexible" in proc and not isinstance(proc["is_flexible"], bool):
             _add_problem(
@@ -264,9 +319,9 @@ def validate_user_input(data):
         capacity_units = proc.get("capacity_units", 1)
         if (not isinstance(capacity_units, (int, float))
             or isinstance(capacity_units, bool)
-            or not math.isfinite(capacity_units)
+            or not _is_finite_number(capacity_units)
             or capacity_units < 1
-            or not float(capacity_units).is_integer()):
+            or int(capacity_units) != capacity_units):
             _add_problem(
                 problems,
                 f"process '{pid or index}': capacity_units must be a positive "
@@ -307,6 +362,28 @@ def validate_user_input(data):
                     f"machine '{mid or index}': {field} must be a finite "
                     f"number (no NaN/Infinity), got {value!r}",
                 )
+        if ("availability" in machine
+                and not isinstance(machine["availability"], str)):
+            _add_problem(
+                problems,
+                f"machine '{mid or index}': availability must be a string",
+            )
+        if "compatible_processes" in machine:
+            compatible = machine["compatible_processes"]
+            if not isinstance(compatible, list):
+                _add_problem(
+                    problems,
+                    f"machine '{mid or index}': compatible_processes must be a list",
+                )
+            else:
+                for process_id in compatible:
+                    if not isinstance(process_id, str):
+                        _add_problem(
+                            problems,
+                            f"machine '{mid or index}': compatible_processes "
+                            "entries must be strings",
+                        )
+                        break
 
     # ---- cross-checks ----------------------------------------------------
     for proc in processes:
@@ -315,6 +392,8 @@ def validate_user_input(data):
         pid = proc.get("process_id") or "?"
         deps = proc.get("dependencies", []) or []
         for dep in deps:
+            if not isinstance(dep, str):
+                continue
             if dep not in process_ids:
                 _add_problem(
                     problems,
@@ -338,28 +417,19 @@ def validate_user_input(data):
     graph = {}
     for proc in processes:
         if isinstance(proc, dict) and isinstance(proc.get("process_id"), str):
-            graph[proc["process_id"]] = list(proc.get("dependencies", []) or [])
+            raw_dependencies = proc.get("dependencies", []) or []
+            graph[proc["process_id"]] = [
+                dependency for dependency in raw_dependencies
+                if isinstance(dependency, str)
+            ]
 
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color = {pid: WHITE for pid in graph}
-    cycles = []
-
-    def visit(node, stack):
-        color[node] = GRAY
-        for dep in graph.get(node, []):
-            if color.get(dep) == GRAY:
-                cycles.append(stack + [dep, node])
-            elif color.get(dep) == WHITE:
-                visit(dep, stack + [dep])
-        color[node] = BLACK
-
-    for pid in graph:
-        if color[pid] == WHITE:
-            visit(pid, [pid])
-
-    for cycle in cycles:
-        chain = " -> ".join(cycle)
-        _add_problem(problems, f"circular dependency detected: {chain}")
+    _, cyclic = dependency_topological_order(graph)
+    if cyclic:
+        _add_problem(
+            problems,
+            "circular dependency detected among processes: "
+            f"{cyclic}",
+        )
 
     # Time-window feasibility on the half-hour grid. Lower bounds round up;
     # upper bounds round down, matching the solver's integer ticks.
@@ -428,7 +498,8 @@ def validate_user_input(data):
     # Cost encoding: power * tariff * duration * COST_SCALE must fit in the
     # per-process cost variable domain. Solar encoding: min(solar, power) *
     # duration * SOLAR_SCALE must fit in the solar variable domain.
-    if tariff_profile and solar_profile:
+    if (isinstance(tariff_profile, dict) and tariff_profile
+            and isinstance(solar_profile, dict) and solar_profile):
         valid_tariffs = [
             v for k, v in tariff_profile.items()
             if isinstance(k, int) and not isinstance(k, bool)

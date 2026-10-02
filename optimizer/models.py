@@ -46,12 +46,19 @@ def time_to_grid_ceil(hours):
 def is_integer_scaled(value, scale):
     """Whether a finite numeric input is represented exactly at ``scale``."""
     if (not isinstance(value, (int, float)) or isinstance(value, bool)
-            or not math.isfinite(value)):
+            or not _is_finite_real(value)):
         return False
     scaled = value * scale
-    return math.isfinite(scaled) and math.isclose(
+    return _is_finite_real(scaled) and math.isclose(
         scaled, round(scaled), rel_tol=0.0, abs_tol=1e-8
     )
+
+
+def _is_finite_real(value):
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
 
 
 def energy_precision_problems(processes, solar_profile, tariff_profile):
@@ -59,9 +66,10 @@ def energy_precision_problems(processes, solar_profile, tariff_profile):
     problems = []
     per_slot_scale = SOLAR_SCALE / TIME_SCALE
 
-    for tariff in tariff_profile.values():
+    tariffs = tariff_profile.values() if isinstance(tariff_profile, dict) else ()
+    for tariff in tariffs:
         if (isinstance(tariff, (int, float)) and not isinstance(tariff, bool)
-                and math.isfinite(tariff)
+                and _is_finite_real(tariff)
                 and not is_integer_scaled(tariff, COST_SCALE)):
             problems.append(
                 "energy.tariff_profile values must be representable at "
@@ -70,9 +78,11 @@ def energy_precision_problems(processes, solar_profile, tariff_profile):
             break
 
     valid_solar = []
-    for hour, solar_kw in solar_profile.items():
+    solar_values = solar_profile.items() if isinstance(solar_profile, dict) else ()
+    for hour, solar_kw in solar_values:
         if (not isinstance(solar_kw, (int, float))
-                or isinstance(solar_kw, bool) or not math.isfinite(solar_kw)):
+                or isinstance(solar_kw, bool)
+                or not _is_finite_real(solar_kw)):
             continue
         if not is_integer_scaled(solar_kw, SOLAR_SCALE):
             problems.append(
@@ -91,7 +101,8 @@ def energy_precision_problems(processes, solar_profile, tariff_profile):
         else:
             continue
         if (not isinstance(power_kw, (int, float))
-                or isinstance(power_kw, bool) or not math.isfinite(power_kw)):
+            or isinstance(power_kw, bool)
+            or not _is_finite_real(power_kw)):
             continue
         if not is_integer_scaled(power_kw, per_slot_scale):
             problems.append(
@@ -108,6 +119,36 @@ def energy_precision_problems(processes, solar_profile, tariff_profile):
                 )
                 break
     return problems
+
+
+def dependency_topological_order(dependencies_by_process):
+    """Return a topological order and cyclic nodes using iterative Kahn traversal."""
+    process_ids = list(dependencies_by_process)
+    process_id_set = set(process_ids)
+    successors = {process_id: [] for process_id in process_ids}
+    indegree = {process_id: 0 for process_id in process_ids}
+    for process_id, dependencies in dependencies_by_process.items():
+        for dependency in set(dependencies):
+            if dependency in process_id_set:
+                successors[dependency].append(process_id)
+                indegree[process_id] += 1
+
+    ready = [process_id for process_id in process_ids
+             if indegree[process_id] == 0]
+    order = []
+    cursor = 0
+    while cursor < len(ready):
+        process_id = ready[cursor]
+        cursor += 1
+        order.append(process_id)
+        for successor in successors[process_id]:
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                ready.append(successor)
+
+    cyclic = sorted(process_id for process_id in process_ids
+                    if indegree[process_id] > 0)
+    return order, cyclic
 
 
 def max_supported_cost_per_process():
@@ -183,6 +224,10 @@ class ProcessSpec:
         _require(
             isinstance(deps, list),
             f"{factory_name}: {where}.dependencies must be a list",
+        )
+        _require(
+            all(isinstance(dependency, str) for dependency in deps),
+            f"{factory_name}: {where}.dependencies entries must be strings",
         )
         self.dependencies = list(deps)
 
@@ -264,10 +309,9 @@ class MachineSpec:
         self.machine_name = data.get("machine_name", self.machine_id)
         _require_id_value(factory_name, where, "machine_name", self.machine_name)
 
-        # capacity / availability / compatible processes / machine power:
-        # availability, compatible_processes and machine power are DEMO
-        # informational fields; capacity IS a real scheduling constraint
-        # (max number of simultaneously running processes).
+        # capacity is enforced as the maximum simultaneous capacity units.
+        # availability, compatible_processes, and machine power are metadata;
+        # they do not change process eligibility, calendars, or energy use.
         capacity = data.get("capacity", 1)
         if capacity is not None:
             _require(
@@ -421,23 +465,16 @@ class FactoryConfig:
                 )
 
     def _validate_acyclic_dependencies(self):
-        # Topological sort (Kahn's algorithm); leftover nodes mean a cycle.
-        remaining_deps = {
-            p.process_id: set(p.dependencies) for p in self.processes
+        dependencies = {
+            process.process_id: process.dependencies
+            for process in self.processes
         }
-        while remaining_deps:
-            ready = [
-                pid for pid, deps in remaining_deps.items() if not deps
-            ]
-            _require(
-                ready,
-                f"{self.factory_name}: dependency cycle detected among processes: "
-                f"{sorted(remaining_deps)}",
-            )
-            for pid in ready:
-                del remaining_deps[pid]
-            for deps in remaining_deps.values():
-                deps.difference_update(ready)
+        _, cyclic = dependency_topological_order(dependencies)
+        _require(
+            not cyclic,
+            f"{self.factory_name}: dependency cycle detected among processes: "
+            f"{cyclic}",
+        )
 
     def _validate_deadlines(self):
         # Lower bounds round up and finish bounds round down to the grid.

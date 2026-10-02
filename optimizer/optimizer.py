@@ -680,6 +680,11 @@ def _extract_schedule(config, solver, status_name, start_times, end_times,
             "power_kw": process.power_kw,
             "is_flexible": process.is_flexible,
             "machine_id": process.machine_id,
+            "capacity_units": process.capacity_units,
+            "machine_capacity": (
+                config.get_machine(process.machine_id).capacity
+                if process.machine_id is not None else None
+            ),
             "quantity": process.quantity,
             "solar_availability": get_solar_availability(int(start_time), solar_profile),
             "solar_energy_kwh": solar_energy,

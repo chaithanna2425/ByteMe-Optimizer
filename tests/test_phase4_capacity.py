@@ -15,6 +15,8 @@ from optimizer.public_api import (
     STATUS_OPTIMAL,
     optimize,
 )
+from optimizer.app import machine_utilization, review_input
+from optimizer.input_layer import load_user_input
 
 
 def cap_factory(capacity, n_processes, tariff=None):
@@ -198,6 +200,42 @@ class CapacityConstraintTests(unittest.TestCase):
             maximum_demand = max(maximum_demand, running_demand)
             self.assertLessEqual(running_demand, 4)
         self.assertEqual(maximum_demand, 4)
+        self.assertEqual(
+            result["result"]["machine_utilization"]["optimized"]["shared"][
+                "peak_capacity_units"
+            ],
+            4,
+        )
+
+    def test_capacity_units_survive_review_and_public_projection(self):
+        data = weighted_capacity_factory(4, [2])
+        config = load_user_input(data)
+        reviewed = review_input(config)
+        self.assertEqual(
+            reviewed["factory"]["processes"][0]["capacity_units"], 2
+        )
+
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        row = result["result"]["optimized"]["processes"][0]
+        self.assertEqual(row["capacity_units"], 2)
+        self.assertEqual(row["machine_capacity"], 4)
+
+    def test_capacity_utilization_is_weighted_and_bounded(self):
+        schedule = {
+            "makespan": 4,
+            "processes": [
+                {"machine_id": "m", "machine_capacity": 2,
+                 "capacity_units": 1, "start_time": 0, "end_time": 4},
+                {"machine_id": "m", "machine_capacity": 2,
+                 "capacity_units": 1, "start_time": 0, "end_time": 4},
+            ],
+        }
+        stats = machine_utilization(schedule)["m"]
+        self.assertEqual(stats["capacity_unit_hours"], 8)
+        self.assertEqual(stats["peak_capacity_units"], 2)
+        self.assertEqual(stats["capacity"], 2)
+        self.assertEqual(stats["utilization_percent"], 100)
 
     def test_capacity_units_default_to_one(self):
         data = cap_factory(2, 3)
@@ -206,7 +244,7 @@ class CapacityConstraintTests(unittest.TestCase):
         self.assertEqual(len(result["result"]["optimized"]["processes"]), 3)
 
     def test_invalid_or_oversized_capacity_units_are_rejected(self):
-        for demand in (0, -1, 1.5, True):
+        for demand in (0, -1, 1.5, True, 10**1000):
             with self.subTest(demand=demand):
                 result = optimize(weighted_capacity_factory(4, [demand]))
                 self.assertEqual(result["status"], STATUS_INVALID_INPUT)

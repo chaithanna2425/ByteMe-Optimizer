@@ -312,6 +312,25 @@ class OptimizeInvalidInputTests(unittest.TestCase):
         self.assertTrue(any("uniform across the planning horizon" in w
                             for w in result["warnings"]))
 
+    def test_unknown_optimization_preserves_successful_baseline(self):
+        with patch(
+                "optimizer.public_api.create_cost_optimized_schedule",
+                side_effect=SolverUnknownError("test limit", 0.25)):
+            result = optimize(copy.deepcopy(VALID_WIDGET))
+
+        self.assertEqual(result["status"], STATUS_UNKNOWN)
+        payload = result["result"]
+        self.assertEqual(payload["baseline"]["status"], STATUS_OPTIMAL)
+        self.assertGreater(len(payload["baseline"]["processes"]), 0)
+        self.assertIsNone(payload["optimized"])
+        self.assertEqual(payload["solve_time_seconds"], round(
+            payload["baseline"]["solve_time_seconds"] + 0.25, 4
+        ))
+        self.assertTrue(any("baseline schedule is available" in warning
+                            for warning in payload["warnings"]))
+        if _HAS_JSONSCHEMA:
+            jsonschema.validate(result, public_api.get_output_schema())
+
     def test_earliest_start_rounds_up_to_the_half_hour_grid(self):
         data = copy.deepcopy(VALID_WIDGET)
         process = data["factory"]["processes"][0]
@@ -415,6 +434,33 @@ class OptimizeInvalidInputTests(unittest.TestCase):
         self.assertGreaterEqual(row["start_time"], 1.0)
         self.assertAlmostEqual(row["energy_cost"], 0.0001, places=9)
 
+    def test_informational_fields_do_not_change_schedule(self):
+        original = copy.deepcopy(VALID_WIDGET)
+        changed = copy.deepcopy(VALID_WIDGET)
+        for process in changed["factory"]["processes"]:
+            process["quantity"] = 10_000
+        for machine in changed["factory"]["machines"]:
+            machine["power_kw"] = 9_999
+            machine["availability"] = "unavailable all day"
+            machine["compatible_processes"] = []
+
+        baseline_result = optimize(original)
+        changed_result = optimize(changed)
+        self.assertEqual(baseline_result["status"], STATUS_OPTIMAL)
+        self.assertEqual(changed_result["status"], STATUS_OPTIMAL)
+        for schedule_name in ("baseline", "optimized"):
+            fields = ("process_id", "start_time", "end_time", "energy_cost",
+                      "solar_kwh", "grid_kwh")
+            baseline_rows = [
+                {field: row[field] for field in fields}
+                for row in baseline_result["result"][schedule_name]["processes"]
+            ]
+            changed_rows = [
+                {field: row[field] for field in fields}
+                for row in changed_result["result"][schedule_name]["processes"]
+            ]
+            self.assertEqual(baseline_rows, changed_rows)
+
     def test_invalid_objective_is_invalid_input(self):
         for source, objective in (
                 (copy.deepcopy(VALID_WIDGET), "banana"),
@@ -426,6 +472,112 @@ class OptimizeInvalidInputTests(unittest.TestCase):
                 self.assertIsNone(result["result"])
                 self.assertTrue(any("objective" in error.lower()
                                     for error in result["errors"]))
+
+    def test_malformed_energy_containers_are_invalid_without_solving(self):
+        invalid_energy = (
+            None,
+            [],
+            {"solar_profile": None},
+            {"solar_profile": []},
+            {"tariff_profile": None},
+            {"tariff_profile": []},
+            {"unknown_profile": {}},
+        )
+        for energy in invalid_energy:
+            with self.subTest(energy=energy):
+                data = copy.deepcopy(VALID_WIDGET)
+                data["energy"] = energy
+                with patch("optimizer.public_api.create_baseline_schedule") as solve:
+                    result = optimize(data)
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                self.assertTrue(result["errors"])
+                self.assertIsNone(result["result"])
+                solve.assert_not_called()
+
+    def test_options_are_validated_against_the_declared_contract(self):
+        invalid_options = (
+            None,
+            [],
+            {"max_time_second": 0.01},
+            {"unexpected": True},
+            {"objective": "banana"},
+            {"max_time_seconds": "fast"},
+            {"max_time_seconds": 0},
+        )
+        for options in invalid_options:
+            with self.subTest(options=options):
+                data = copy.deepcopy(VALID_WIDGET)
+                data["options"] = options
+                with patch("optimizer.public_api.create_baseline_schedule") as solve:
+                    result = optimize(data)
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                self.assertTrue(result["errors"])
+                self.assertIsNone(result["result"])
+                solve.assert_not_called()
+
+        data = copy.deepcopy(VALID_WIDGET)
+        data["options"] = {"objective": "solar", "max_time_seconds": None}
+        self.assertEqual(optimize(data)["status"], STATUS_OPTIMAL)
+
+    def test_schema_invalid_shapes_never_reach_solver(self):
+        invalid_sources = []
+        for energy in (None, [], "bad"):
+            data = copy.deepcopy(VALID_WIDGET)
+            data["energy"] = energy
+            invalid_sources.append(data)
+        for profile in (None, [], "bad"):
+            for profile_name in ("solar_profile", "tariff_profile"):
+                data = copy.deepcopy(VALID_WIDGET)
+                data["energy"][profile_name] = profile
+                invalid_sources.append(data)
+        data = copy.deepcopy(VALID_WIDGET)
+        data["energy"]["unknown_energy_field"] = True
+        invalid_sources.append(data)
+        data = copy.deepcopy(VALID_WIDGET)
+        data["unknown_top_level_field"] = True
+        invalid_sources.append(data)
+        for options in (
+                None, [], "bad", {"objective": "other"},
+                {"max_time_seconds": 0},
+                {"max_time_seconds": float("nan")},
+                {"max_time_seconds": "fast"},
+                {"max_time_second": 1},
+                {"unknown_option": True}):
+            data = copy.deepcopy(VALID_WIDGET)
+            data["options"] = options
+            invalid_sources.append(data)
+
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with patch("optimizer.public_api.create_baseline_schedule") as solve:
+                    result = optimize(source)
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                self.assertTrue(result["errors"])
+                self.assertIsNone(result["result"])
+                solve.assert_not_called()
+
+    def test_profile_hour_range_matches_json_schema(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["energy"]["solar_profile"][24] = 1
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertTrue(any("invalid hour" in error
+                            for error in result["errors"]))
+        if _HAS_JSONSCHEMA:
+            json_data = json.loads(json.dumps(data))
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(json_data, public_api.get_input_schema())
+
+    def test_unknown_top_level_and_energy_fields_are_rejected(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["objective"] = "cost"
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+
+        data = copy.deepcopy(VALID_WIDGET)
+        data["energy"]["time_zone"] = "UTC"
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
 
     def test_malformed_json_string(self):
         result = optimize("{not valid json")
@@ -512,7 +664,8 @@ class ContractStabilityTests(unittest.TestCase):
     def test_input_schema_accepts_widget_lab(self):
         if _HAS_JSONSCHEMA:
             jsonschema.validate(
-                copy.deepcopy(VALID_WIDGET), public_api.get_input_schema()
+                json.loads(json.dumps(VALID_WIDGET)),
+                public_api.get_input_schema(),
             )
 
     def test_engine_stays_agnostic(self):

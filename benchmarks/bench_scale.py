@@ -7,7 +7,8 @@ CP-SAT solve times and model sizes for the domain-pruned start-slot encoding.
 Usage:
     python benchmarks/bench_scale.py [--quick] [--repeats N] [--output PATH]
 
-Records: processes, horizon, contention, wall time per solve, status.
+Records: processes, horizon, contention, stage times/statuses, model sizes,
+branches, conflicts, deterministic/wall/user time, memory, and repeats.
 Grid: processes x {10, 25, 50, 100} x horizons {24, 48, 168} x
 contention {low, high}.
 """
@@ -102,6 +103,13 @@ def measure(case):
             }
             status = self.solver.Solve(model)
             stats["solve_time_seconds"] = self.solver.WallTime()
+            stats["wall_time_seconds"] = self.solver.WallTime()
+            stats["user_time_seconds"] = self.solver.UserTime()
+            stats["deterministic_time_seconds"] = (
+                self.solver.ResponseProto().deterministic_time
+            )
+            stats["branches"] = self.solver.NumBranches()
+            stats["conflicts"] = self.solver.NumConflicts()
             stats["status"] = self.solver.StatusName(status)
             solve_metrics.append(stats)
             return status
@@ -153,15 +161,20 @@ def main():
                 case = build_case(n, horizon, contention)
                 measurements = [measure(case) for _ in range(args.repeats)]
                 solve_metrics = [measurement[3] for measurement in measurements]
-                baseline_solve = statistics.median(
-                    run[0]["solve_time_seconds"] for run in solve_metrics
-                )
-                optimized_samples = [
-                    run[1]["solve_time_seconds"] for run in solve_metrics
-                    if len(run) > 1
+                baseline_solver_runs = [run[0] for run in solve_metrics]
+                optimized_solver_runs = [
+                    run[1] for run in solve_metrics if len(run) > 1
                 ]
-                optimized_solve = (statistics.median(optimized_samples)
-                                   if optimized_samples else None)
+                baseline_solve = statistics.median(
+                    run["solve_time_seconds"] for run in baseline_solver_runs
+                )
+                optimized_solve = (
+                    statistics.median(
+                        run["solve_time_seconds"]
+                        for run in optimized_solver_runs
+                    )
+                    if optimized_solver_runs else None
+                )
                 baseline_model = solve_metrics[0][0]
                 optimized_model = (solve_metrics[0][1]
                                    if len(solve_metrics[0]) > 1 else None)
@@ -179,10 +192,64 @@ def main():
                     "contention": contention, "machines": n_machines,
                     "repeats": args.repeats,
                     "baseline_solve_seconds": round(baseline_solve, 4),
+                    "baseline_wall_time_seconds": round(statistics.median(
+                        run["wall_time_seconds"]
+                        for run in baseline_solver_runs
+                    ), 4),
+                    "baseline_user_time_seconds": round(statistics.median(
+                        run["user_time_seconds"]
+                        for run in baseline_solver_runs
+                    ), 4),
+                    "baseline_deterministic_time_seconds": round(
+                        statistics.median(
+                            run["deterministic_time_seconds"]
+                            for run in baseline_solver_runs
+                        ), 6
+                    ),
+                    "baseline_branches": int(statistics.median(
+                        run["branches"] for run in baseline_solver_runs
+                    )),
+                    "baseline_conflicts": int(statistics.median(
+                        run["conflicts"] for run in baseline_solver_runs
+                    )),
+                    "baseline_solver_statuses": [
+                        run["status"] for run in baseline_solver_runs
+                    ],
                     "optimized_solve_seconds": (
                         round(optimized_solve, 4)
                         if optimized_solve is not None else None
                     ),
+                    "optimized_wall_time_seconds": (
+                        round(statistics.median(
+                            run["wall_time_seconds"]
+                            for run in optimized_solver_runs
+                        ), 4) if optimized_solver_runs else None
+                    ),
+                    "optimized_user_time_seconds": (
+                        round(statistics.median(
+                            run["user_time_seconds"]
+                            for run in optimized_solver_runs
+                        ), 4) if optimized_solver_runs else None
+                    ),
+                    "optimized_deterministic_time_seconds": (
+                        round(statistics.median(
+                            run["deterministic_time_seconds"]
+                            for run in optimized_solver_runs
+                        ), 6) if optimized_solver_runs else None
+                    ),
+                    "optimized_branches": (
+                        int(statistics.median(
+                            run["branches"] for run in optimized_solver_runs
+                        )) if optimized_solver_runs else None
+                    ),
+                    "optimized_conflicts": (
+                        int(statistics.median(
+                            run["conflicts"] for run in optimized_solver_runs
+                        )) if optimized_solver_runs else None
+                    ),
+                    "optimized_solver_statuses": [
+                        run["status"] for run in optimized_solver_runs
+                    ],
                     "total_optimize_seconds": round(total_elapsed, 4),
                     "baseline_variables": baseline_model["variables"],
                     "baseline_boolean_variables":
