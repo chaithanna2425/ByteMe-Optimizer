@@ -1,15 +1,15 @@
 """
 ByteMe Phase 4.3 Tests: Shared Solar Pool (DEMO/SIMULATED DATA ONLY)
 
-Solar is a physically shared hourly resource. For every clock hour:
+Solar is a physically shared half-hour-slot resource. For every slot:
 
-    sum(allocated_solar[p, hour] for all running processes p)
-        <= solar_profile[hour]
+    sum(allocated_solar[p, slot] for all running processes p)
+        <= solar_profile[hour] * slot_duration
 
 A process never receives more solar than its own power demand over the
-part of the hour it occupies, and never draws from a time it was not
+part of the slot it occupies, and never draws from a time it was not
 running. The pool lives INSIDE the CP-SAT model (run[p, slot] booleans
-linked to start times, integer share variables, per-hour pool constraint),
+linked to start times, integer share variables, per-slot pool constraint),
 so both the cost and the solar objective optimize against physically
 available solar - there is no post-solve cosmetic cap.
 """
@@ -36,6 +36,27 @@ from optimizer.public_api import (
 NO_SOLAR = {h: 0 for h in range(24)}
 FLAT_TARIFF = {h: 0.5 for h in range(24)}
 DEMO_TARIFF_DAY = {h: (0.10 if 9 <= h <= 15 else 0.50) for h in range(24)}
+
+
+class LinearExpressionAggregationEquivalence(unittest.TestCase):
+    def test_linear_expr_sum_matches_python_sum_proto(self):
+        def build_model(use_linear_sum):
+            model = cp_model.CpModel()
+            variables = [model.NewIntVar(0, 1, f"x{index}")
+                         for index in range(12)]
+            terms = [(index % 4 + 1) * variable
+                     for index, variable in enumerate(variables)]
+            aggregate = (cp_model.LinearExpr.sum(terms) if use_linear_sum
+                         else sum(terms, 0))
+            total = model.NewIntVar(0, 40, "total")
+            empty_aggregate = (
+                cp_model.LinearExpr.sum([]) if use_linear_sum else sum([], 0)
+            )
+            model.Add(total <= aggregate)
+            model.Add(total == empty_aggregate)
+            return str(model.Proto())
+
+        self.assertEqual(build_model(True), build_model(False))
 
 
 def pool_factory(processes, machines, horizon=24, deadline=20,
@@ -92,16 +113,16 @@ def _window(row):
 def recompute_pool_costs(rows, solar_profile, tariff_profile):
     """
     Independent shared-pool recomputation of per-row energy and cost.
-    Deterministic greedy split of each hourly pool in process_id order -
+    Deterministic greedy split of each slot pool in process_id order -
     the documented reporting rule.
     """
     running = {}
     for row in sorted(rows, key=lambda r: r["process_id"]):
         t = row["start_time"]
         while t < row["end_time"]:
-            hour = int(t)
-            overlap = min(hour + 1, row["end_time"]) - t
-            running.setdefault(hour, []).append(
+            slot = int(t * 2)
+            overlap = min((slot + 1) / 2, row["end_time"]) - t
+            running.setdefault(slot, []).append(
                 (row["process_id"], row["power_kw"] * overlap, overlap)
             )
             t += overlap
@@ -114,8 +135,9 @@ def recompute_pool_costs(rows, solar_profile, tariff_profile):
         grid_by_pid[row["process_id"]] = 0.0
         cost_by_pid[row["process_id"]] = 0.0
 
-    for hour, runners in running.items():
-        supply = solar_profile.get(hour % 24, 0) * 1.0
+    for slot, runners in running.items():
+        hour = slot // 2
+        supply = solar_profile.get(hour % 24, 0) * 0.5
         for pid, demand, overlap in sorted(runners):
             draw_cap = solar_profile.get(hour % 24, 0) * overlap
             solar = min(demand, draw_cap, max(supply, 0.0))
@@ -128,7 +150,7 @@ def recompute_pool_costs(rows, solar_profile, tariff_profile):
 
 
 class ReportingNeverOverallocates(unittest.TestCase):
-    """The greedy allocator itself must respect the hourly pool + draw cap."""
+    """The greedy allocator must respect the slot pool + draw cap."""
 
     def test_allocator_partial_hour_no_longer_gets_whole_hour_supply(self):
         # 10 kW process for 0.5 h inside a 4 kW-solar hour: the OLD bug gave
@@ -149,6 +171,20 @@ class ReportingNeverOverallocates(unittest.TestCase):
         self.assertAlmostEqual(alloc["a"]["solar_kwh"], 20.0, places=9)
         self.assertAlmostEqual(alloc["b"]["solar_kwh"], 0.0, places=9)
 
+    def test_allocator_shares_solar_within_the_same_half_hour(self):
+        rows = [
+            {"process_id": "a", "start_time": 9.0, "end_time": 9.5,
+             "power_kw": 10},
+            {"process_id": "b", "start_time": 9.0, "end_time": 9.5,
+             "power_kw": 10},
+        ]
+        alloc = allocate_solar_greedy(
+            rows, {h: 10 for h in range(24)}
+        )
+        self.assertAlmostEqual(
+            sum(row["solar_kwh"] for row in alloc.values()), 5.0, places=9
+        )
+
     def test_allocator_zero_solar_hour(self):
         rows = [{"process_id": "a", "start_time": 3.0, "end_time": 4.0,
                  "power_kw": 10}]
@@ -159,6 +195,27 @@ class ReportingNeverOverallocates(unittest.TestCase):
 
 class SharedPoolInsideModel(unittest.TestCase):
     """The pool is a constraint of the optimization, not a cosmetic cap."""
+
+    def test_concurrent_half_hour_processes_share_one_slot_pool(self):
+        processes, machines = two_machines_two_processes(
+            power=10, duration=0.5
+        )
+        for process in processes:
+            process["is_flexible"] = False
+        data = pool_factory(
+            processes, machines, horizon=2, deadline=2,
+            solar_profile={h: 10 for h in range(24)},
+            tariff_profile={h: 0.5 for h in range(24)},
+        )
+
+        result = optimize(data, objective="solar")
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        optimized = result["result"]["optimized"]
+        self.assertEqual(
+            {row["start_time"] for row in optimized["processes"]}, {0.0}
+        )
+        self.assertAlmostEqual(optimized["energy"]["solar_kwh"], 5.0)
+        self.assertAlmostEqual(optimized["energy"]["grid_kwh"], 5.0)
 
     def test_concurrent_processes_cannot_double_claim_solar(self):
         # Two 10 kW processes, 1 h each, can run concurrently on two
@@ -214,12 +271,12 @@ class SharedPoolInsideModel(unittest.TestCase):
         result = optimize(data, objective="solar")
         self.assertEqual(result["status"], STATUS_OPTIMAL)
         rows = list(rows_by_id(result).values())
-        # Total demand is 3 x 2 h x 10 kW = 60 kWh; the 20 kW hourly pool
-        # can cover all of it if runs are spread (pool is a per-hour flow).
+        # Total demand is 3 x 2 h x 10 kW = 60 kWh; the 20 kW profile can
+        # cover all of it if runs are spread across enough half-hour slots.
         # The objective must maximize allocation up to exactly that.
         self.assertAlmostEqual(sum(r["solar_kwh"] for r in rows),
                                60.0, places=6)
-        # ...and no single hour may exceed the physical 20 kWh pool.
+        # ...and no hour may exceed the physical 20 kWh across its two slots.
         per_hour = {}
         for row in rows:
             t = row["start_time"]
@@ -577,6 +634,72 @@ class DomainPruningEquivalenceTests(unittest.TestCase):
                      if variable.name.startswith("run_root_")]
         self.assertEqual(len(run_names), 1)
         self.assertEqual(root_start * 2, fixed["root"])
+
+
+class UnreachableHourSolarPinning(unittest.TestCase):
+    """Hours no process can reach must never credit phantom solar.
+
+    Regression: the per-hour pool cap constraint was skipped whenever no
+    process could draw in that hour (e.g. hours between the production
+    deadline and the planning horizon). used[hour] was then free up to the
+    physical pool and the objective claimed solar nobody could draw, so
+    the in-model objective no longer matched the reported schedule
+    metrics for inputs with a sunny deadline gap.
+    """
+
+    def _factory(self):
+        return pool_factory(
+            [{"process_id": "solo", "process_name": "Solo",
+              "duration_hours": 1, "power_kw": 10,
+              "dependencies": [], "is_flexible": True}],
+            [],
+            horizon=12, deadline=10,
+            solar_profile={h: (5.0 if h >= 10 else 0.0) for h in range(24)},
+            tariff_profile={h: 0.5 for h in range(24)},
+        )
+
+    def test_unreachable_sunny_hours_are_pinned_to_zero(self):
+        data = self._factory()
+        config = load_factory_config(data["factory"])
+        model, starts, _ = _build_base_model(config)
+        share, demand = _add_shared_solar_pool(
+            config, model, starts, data["energy"]["solar_profile"],
+            fixed_start_times={},
+        )
+        domains = {variable.name: list(variable.domain)
+                   for variable in model.Proto().variables}
+        for slot in (20, 21, 22, 23):
+            self.assertEqual(domains[f"solar_used_{slot}"], [0, 0])
+
+    def test_cost_objective_matches_reported_metrics_with_sunny_gap(self):
+        data = self._factory()
+        result = optimize(data, objective="cost")
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        optimized = result["result"]["optimized"]
+        rows = [{"process_id": row["process_id"],
+                 "start_time": row["start_time"],
+                 "end_time": row["end_time"],
+                 "power_kw": row["power_kw"]}
+                for row in optimized["processes"]]
+        solar_by_id, grid_by_id, cost_by_id = recompute_pool_costs(
+            rows, data["energy"]["solar_profile"],
+            data["energy"]["tariff_profile"])
+        reported_cost = sum(row["energy_cost"]
+                            for row in optimized["processes"])
+        self.assertAlmostEqual(reported_cost, sum(cost_by_id.values()))
+        # True optimum: the solo process pays full grid price for 10 kWh
+        # (cost 5.0); it cannot run in the sunny hours 10-11, so zero
+        # solar is creditable. Before the fix the model credited the
+        # unreachable 5 kW pools as free solar.
+        self.assertAlmostEqual(optimized["energy"]["grid_kwh"], 10.0)
+        self.assertAlmostEqual(optimized["energy"]["solar_kwh"], 0.0)
+
+    def test_solar_objective_claims_no_unreachable_solar(self):
+        data = self._factory()
+        result = optimize(data, objective="solar")
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        optimized = result["result"]["optimized"]
+        self.assertAlmostEqual(optimized["energy"]["solar_kwh"], 0.0)
 
 
 if __name__ == "__main__":

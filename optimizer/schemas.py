@@ -12,7 +12,7 @@ These schemas describe DEMO/SIMULATED data only.
 INPUT_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "title": "ByteMe Optimizer Input",
-    "description": "Canonical factory + energy input (DEMO/SIMULATED data).",
+    "description": "Canonical normalized factory and energy input. The optimizer enforces process duration/power, dependencies, deadlines and time windows, assigned-machine capacity, capacity_units, profiles, and objective. Quantity and machine power/availability/compatibility are informational only.",
     "type": "object",
     "required": ["factory"],
     "properties": {
@@ -24,6 +24,7 @@ INPUT_SCHEMA = {
             ],
             "properties": {
                 "factory_name": {"type": "string", "minLength": 1},
+                "factory_id": {"type": "string", "minLength": 1},
                 "factory_type": {"type": "string", "minLength": 1},
                 "planning_horizon_hours": {
                     "type": "number", "exclusiveMinimum": 0,
@@ -44,9 +45,9 @@ INPUT_SCHEMA = {
                             "process_id": {"type": "string", "minLength": 1},
                             "process_name": {"type": "string", "minLength": 1},
                             "duration_hours": {
-                                "type": "number",
+                                "type": "number", "exclusiveMinimum": 0,
                                 "multipleOf": 0.5,
-                                "description": "multiple of 0.5 (half-hour grid)",
+                                "description": "Process duration in hours; positive multiples of 0.5 on the half-hour scheduling grid.",
                             },
                             "power_kw": {"type": "number", "minimum": 0,
                                 "multipleOf": 0.2,
@@ -61,12 +62,27 @@ INPUT_SCHEMA = {
                                 "description": "Informational only; does not "
                                                "change duration, power, or demand",
                             },
+                            "quantity_unit": {
+                                "type": ["string", "null"],
+                                "description": "Informational unit for quantity",
+                            },
+                            "work_order_id": {
+                                "type": ["string", "null"],
+                                "description": "Informational source work-order ID",
+                            },
                             "dependencies": {
                                 "type": "array",
                                 "items": {"type": "string"},
                             },
-                            "is_flexible": {"type": "boolean"},
-                            "machine_id": {"type": ["string", "null"]},
+                            "is_flexible": {
+                                "type": "boolean",
+                                "description": "True makes this process eligible to move from its baseline start; false pins it to that baseline start. True does not guarantee a move and false does not name a caller-selected commitment time.",
+                            },
+                            "machine_id": {
+                                "type": ["string", "null"],
+                                "description": "Enforced resource assignment; "
+                                               "same-machine processes share its capacity",
+                            },
                             "capacity_units": {
                                 "type": "integer", "minimum": 1,
                                 "description": "Machine capacity consumed by "
@@ -83,7 +99,7 @@ INPUT_SCHEMA = {
                                                "half-hour finish tick",
                             },
                         },
-                        "additionalProperties": True,
+                        "additionalProperties": False,
                     },
                 },
                 "machines": {
@@ -93,7 +109,7 @@ INPUT_SCHEMA = {
                         "required": ["machine_id"],
                         "properties": {
                             "machine_id": {"type": "string", "minLength": 1},
-                            "machine_name": {"type": "string"},
+                            "machine_name": {"type": "string", "minLength": 1},
                             "availability": {
                                 "type": "string",
                                 "description": "Informational only; not enforced "
@@ -117,16 +133,15 @@ INPUT_SCHEMA = {
                                 "type": "array", "items": {"type": "string"},
                             },
                         },
-                        "additionalProperties": True,
+                        "additionalProperties": False,
                     },
                 },
             },
-            "additionalProperties": True,
+            "additionalProperties": False,
         },
         "energy": {
             "type": "object",
-            "description": "24-hour cyclic profiles (DEMO profiles used as "
-                           "fallback when omitted, surfaced as a warning)",
+                "description": "Profiles use elapsed planning hours; key 0 covers [0, 1) from the planning origin, not a wall-clock hour. An omitted profile uses DEMO data with a warning; omitted hours in a supplied partial profile are zero with a warning. Profiles repeat every 24 hours. Currency is caller-defined, is not converted, and must be consistent within a request.",
             "properties": {
                 "solar_profile": {
                     "type": "object",
@@ -136,7 +151,8 @@ INPUT_SCHEMA = {
                         "pattern": r"^\s*0*(?:[0-9]|1[0-9]|2[0-3])\s*$",
                     },
                     "description": "hour (0-23, int or numeric string) -> "
-                                   "kW in 0.2 increments",
+                                   "available site-wide kW in 0.2 increments; "
+                                   "missing hours are 0; 24-hour profile repeats",
                     "additionalProperties": {
                         "type": "number", "minimum": 0, "multipleOf": 0.2,
                     },
@@ -149,7 +165,8 @@ INPUT_SCHEMA = {
                         "pattern": r"^\s*0*(?:[0-9]|1[0-9]|2[0-3])\s*$",
                     },
                     "description": "hour (0-23, int or numeric string) -> "
-                                   "currency/kWh in 0.001 increments",
+                                   "currency/kWh in 0.001 increments; "
+                                   "missing hours are 0",
                     "additionalProperties": {
                         "type": "number", "minimum": 0, "multipleOf": 0.001,
                     },
@@ -175,9 +192,7 @@ INPUT_SCHEMA = {
                 "max_time_seconds": {
                     "type": ["number", "null"],
                     "exclusiveMinimum": 0,
-                    "description": "Optional per-solve CP-SAT time limit in "
-                                   "seconds. Default: bounded public API "
-                                   "limit. Omit for the default.",
+                    "description": "Optional CP-SAT time limit in seconds per solver stage. One request can run baseline and optimized stages, so total solver time may approach twice this value, plus parsing/model/API overhead. Default: 60 seconds per stage.",
                 },
             },
             "additionalProperties": False,
@@ -191,7 +206,8 @@ OUTPUT_SCHEMA = {
     "title": "ByteMe Optimizer Result",
     "description": "Canonical result envelope (DEMO/SIMULATED data).",
     "type": "object",
-    "required": ["api_version", "status", "result", "errors", "warnings"],
+    "required": ["api_version", "status", "result", "errors", "warnings",
+                 "error_category"],
     "properties": {
         "api_version": {"type": "string"},
         "status": {
@@ -207,6 +223,11 @@ OUTPUT_SCHEMA = {
             "description": "Non-fatal notices (defaults used, cyclic profile "
                            "repeats, normalization). Empty when nothing notable.",
             "items": {"type": "string"},
+        },
+        "error_category": {
+            "type": ["string", "null"],
+            "enum": ["VALIDATION_ERROR", "INFEASIBLE", "INTERNAL_ERROR", None],
+            "description": "Machine-readable failure category; null for non-failure statuses.",
         },
         "result": {
             "type": ["object", "null"],
@@ -227,7 +248,10 @@ OUTPUT_SCHEMA = {
                         "cost_optimized": {"type": "number"},
                         "cost_savings": {"type": "number"},
                         "cost_saving_percent": {"type": "number"},
-                        "solar_utilization_percent": {"type": "number"},
+                        "solar_utilization_percent": {
+                            "type": "number",
+                            "description": "Optimized schedule solar kWh divided by optimized total kWh, multiplied by 100; 0 when total energy is zero.",
+                        },
                         "shifted_processes": {"type": "integer"},
                     },
                 },
@@ -272,11 +296,25 @@ OUTPUT_SCHEMA = {
     "definitions": {
         "schedule": {
             "type": ["object", "null"],
-            "required": ["status", "makespan_hours", "processes", "energy"],
+            "required": ["status", "makespan_hours", "processes", "energy",
+                         "solver_diagnostics"],
             "properties": {
                 "status": {"type": "string"},
                 "makespan_hours": {"type": "number"},
                 "solve_time_seconds": {"type": ["number", "null"]},
+                "solver_diagnostics": {
+                    "type": "object",
+                    "required": ["status", "best_objective", "best_bound",
+                                 "optimality_gap"],
+                    "properties": {
+                        "status": {"type": "string",
+                                   "enum": ["OPTIMAL", "FEASIBLE"]},
+                        "best_objective": {"type": "number"},
+                        "best_bound": {"type": "number"},
+                        "optimality_gap": {"type": "number", "minimum": 0},
+                    },
+                    "description": "CP-SAT objective and bound in the model's encoded objective units; these are not currency or kWh.",
+                },
                 "processes": {
                     "type": "array",
                     "items": {
@@ -298,11 +336,14 @@ OUTPUT_SCHEMA = {
                             "machine_id": {"type": ["string", "null"]},
                             "capacity_units": {"type": "integer", "minimum": 1},
                             "machine_capacity": {"type": ["integer", "null"]},
-                            "quantity": {},
+                            "quantity": {"type": ["number", "null"]},
                             "solar_kwh": {"type": "number"},
                             "grid_kwh": {"type": "number"},
                             "energy_cost": {"type": "number"},
-                            "tariff": {},
+                            "tariff": {
+                                "type": ["number", "null"],
+                                "description": "Hourly tariff at floor(start_time) in currency/kWh; process energy_cost integrates grid energy against each overlapped hour's tariff.",
+                            },
                         },
                     },
                 },

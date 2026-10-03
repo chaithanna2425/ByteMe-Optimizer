@@ -29,9 +29,9 @@ forecasting).
 Version capabilities preserved:
 - V1: baseline scheduling (minimize makespan)
 - V2: solar-aware demand shifting (maximize ALLOCATED solar under the
-  SHARED hourly solar pool, makespan as tiebreaker)
+  SHARED half-hour-slot solar pool, makespan as tiebreaker)
 - V3: solar + tariff cost optimization (minimize grid electricity cost
-  under the SHARED hourly solar pool, makespan as tiebreaker;
+  under the SHARED half-hour-slot solar pool, makespan as tiebreaker;
   non-flexible processes pinned to their baseline start times)
 - V4: all of the above, for ANY factory configuration, with machine/resource
   no-overlap constraints, optional process time windows, and configuration
@@ -72,6 +72,10 @@ class SolverInfeasibleError(RuntimeError):
 
     def __init__(self, solve_time_seconds):
         self.solve_time_seconds = solve_time_seconds
+
+
+class SolverModelInvalidError(RuntimeError):
+    """Raised when CP-SAT rejects a constructed model as invalid."""
 
 
 
@@ -463,63 +467,16 @@ def _pin_non_flexible_processes(config, model, start_times,
     return baseline
 
 
-def _slots_touching_hour(hour, duration, horizon_slots):
+def _process_allowed_slots(config, horizon_slots, prune_domains,
+                           fixed_start_times, start_domains):
     """
-    Yield (slot, count) for every possible start slot whose run touches
-    clock hour, with count = number of its half-hour slots inside that
-    hour (TIME_SCALE slots per hour).
+    Allowed start-slot range per process id:
+    {pid: (first_slot, last_slot, duration_slots)}.
+
+    Shared by the run-boolean creation and the per-hour term collection so
+    both walk exactly the same slot domain (and only once per process).
     """
-    hour_start = hour * TIME_SCALE
-    hour_end = hour_start + TIME_SCALE
-    first = max(0, hour_start - duration + 1)
-    last = min(hour_end - 1, horizon_slots - duration)
-    for slot in range(first, last + 1):
-        overlap = min(slot + duration, hour_end) - max(slot, hour_start)
-        if overlap > 0:
-            yield slot, overlap
-
-
-def _add_shared_solar_pool(config, model, start_times, solar_profile,
-                           prune_domains=True, fixed_start_times=None):
-    """
-    Encode solar as a SHARED hourly resource INSIDE the CP-SAT model.
-
-    For every clock hour h the model carries an integer variable used[h]
-    (0.1 kWh units, SOLAR_SCALE) - the total solar energy allocated to
-    processes in that hour - subject to:
-
-        used[h] <= solar_profile[h % 24]        (the physical pool)
-        used[h] <= sum_p draw_cap[p, h]         (per-process demand caps)
-
-    draw_cap[p, h] is a linear expression over run[p, t] booleans
-    ("process p starts at slot t", exactly-one linked to the existing
-    start-time variables): a running process can draw at most
-    min(solar_kw, power_kw) per occupied half-hour slot, and nothing in
-    hours it does not occupy.
-
-    The aggregate form is exact: for any fixed schedule the deterministic
-    greedy split used for reporting realizes exactly
-    min(pool, sum of draw caps) per hour - precisely the model's upper
-    bound - so optimized objective values equal reported numbers. The
-    pool constraint is part of the optimization model, not a post-solve
-    adjustment.
-
-    Returns:
-        (used, demand): dicts keyed by hour (int).
-        used[h]   IntVar - total allocated solar in hour h, 0.1 kWh units
-        demand[h] linear expression - total process energy demand in
-        hour h, 0.1 kWh units
-    """
-    horizon_slots = time_to_grid_floor(config.planning_horizon_hours)
-    horizon_hours = (horizon_slots + TIME_SCALE - 1) // TIME_SCALE
-    start_domains = _calculate_start_domains(config)
-    fixed_start_times = fixed_start_times or {}
-
-    # run[p, t] == 1  <=>  process p starts at slot t: two-directional
-    # reification (b forces the start; a start != slot forces b false) plus
-    # exactly-one, giving CP-SAT a tight channel between booleans and the
-    # existing start-time variables.
-    run = {}
+    ranges = {}
     for process in config.processes:
         pid = process.process_id
         duration = int(process.duration_hours * TIME_SCALE)
@@ -530,76 +487,188 @@ def _add_shared_solar_pool(config, model, start_times, solar_profile,
             lower_start, upper_start = 0, horizon_slots - duration
         first_slot = max(0, lower_start)
         last_slot = min(horizon_slots - duration, upper_start)
+        ranges[pid] = (first_slot, last_slot, duration)
+    return ranges
+
+
+def _sum_linear_terms(terms):
+    """Aggregate linear terms with OR-Tools' native n-ary sum expression."""
+    return cp_model.LinearExpr.sum(terms)
+
+
+def _add_shared_solar_pool(config, model, start_times, solar_profile,
+                           prune_domains=True, fixed_start_times=None,
+                           collect_demand=True, active_hours=None):
+    """
+    Encode solar as a SHARED half-hour resource INSIDE the CP-SAT model.
+
+    For every half-hour slot s the model carries an integer variable
+    used[s] (0.1 kWh units, SOLAR_SCALE), bounded by both the solar energy
+    available in that slot and the sum of running-process draw caps.
+
+    draw_cap[p, s] is a linear expression over run[p, t] booleans
+    ("process p starts at slot t", exactly-one linked to the existing
+    start-time variables): a running process can draw at most
+    min(solar_kw, power_kw) per occupied half-hour slot, and nothing in
+    hours it does not occupy.
+
+    The booleans use ONE-directional reification: b_t => start == t, plus
+    exactly-one over all allowed-slot booleans. That pair already pins the
+    true boolean to the actual start slot (exactly one b is true, and the
+    true b forces start == its own slot), so the previous reverse
+    implication (start != t => not b_t) was logically redundant and is
+    omitted - identical feasible solutions, half the reification
+    constraints.
+
+    Slots no process can ever occupy (e.g. beyond the production deadline)
+    have an empty draw cap, so used[s] is pinned to 0 by its [0, 0]
+    variable domain - no phantom solar can be credited to empty slots
+    (previously the cap constraint was skipped for such hours, which left
+    used[h] free up to the physical pool and let the objective claim solar
+    nobody could draw).
+
+    active_hours optionally restricts term construction to the hours whose
+    demand/share expressions the caller's objective actually consumes
+    (all hours when None, the default). Inactive hours report constant 0
+    for both used[h] and demand[h]; active hours keep the exact semantics
+    above. collect_demand=False skips the demand expressions entirely
+    (the solar objective never consumes them).
+
+    The aggregate form is exact: for any fixed schedule the deterministic
+    greedy split used for reporting realizes exactly
+    min(pool, sum of draw caps) per half-hour slot - precisely the model's
+    upper bound - so optimized objective values equal reported numbers.
+    The pool constraint is part of the optimization model, not a post-solve
+    adjustment.
+
+    Returns:
+        (used, demand): dicts keyed by hour (int).
+        used[h]   linear expression - total allocated solar in hour h,
+                  summed from its half-hour slot variables
+        demand[h] linear expression (or int 0) - total process energy
+                  demand in hour h, 0.1 kWh units
+    """
+    horizon_slots = time_to_grid_floor(config.planning_horizon_hours)
+    horizon_hours = (horizon_slots + TIME_SCALE - 1) // TIME_SCALE
+    start_domains = _calculate_start_domains(config)
+    fixed_start_times = fixed_start_times or {}
+    active = (set(range(horizon_hours)) if active_hours is None
+              else set(active_hours))
+
+    allowed = _process_allowed_slots(config, horizon_slots, prune_domains,
+                                     fixed_start_times, start_domains)
+
+    # run[p, t] == 1  <=>  process p starts at slot t: forward implication
+    # (b forces the start) plus exactly-one fully determines every boolean
+    # from the start time (see docstring). Hot loop uses the snake_case
+    # CpModel builders directly (the CamelCase names resolve through a
+    # deprecation-wrapper lookup on every call).
+    run = {}
+    add = model.add
+    new_bool_var = model.new_bool_var
+    for process in config.processes:
+        pid = process.process_id
+        first_slot, last_slot, _ = allowed[pid]
         bools = []
         for slot in range(first_slot, last_slot + 1):
-            b = model.NewBoolVar(f"run_{pid}_{slot}")
-            model.Add(start_times[pid] == slot).OnlyEnforceIf(b)
-            model.Add(start_times[pid] != slot).OnlyEnforceIf(b.Not())
+            b = new_bool_var(f"run_{pid}_{slot}")
+            add(start_times[pid] == slot).only_enforce_if(b)
             bools.append(b)
             run[(pid, slot)] = b
         if bools or not prune_domains:
-            model.AddExactlyOne(bools)
+            model.add_exactly_one(bools)
 
-    # Per-hour aggregate: physical pool cap + total draw cap, with demand.
+    # Per-slot aggregate solar caps; hourly demand is kept for tariff costs.
+    # Terms are collected process-major: each process visits only the
+    # clock hours its allowed start slots can possibly touch, and hours
+    # with no possible draw (zero solar / zero power) skip their slot
+    # loop entirely.
+    cap_terms = {
+        tick: []
+        for hour in active
+        for tick in range(hour * TIME_SCALE,
+                          min((hour + 1) * TIME_SCALE, horizon_slots))
+    }
+    demand_terms = {hour: [] for hour in active} if collect_demand else {}
+    for process in config.processes:
+        pid = process.process_id
+        power = process.power_kw
+        first_slot, last_slot, duration = allowed[pid]
+        if first_slot > last_slot:
+            continue  # cannot run anywhere - no draw in any hour
+        per_slot_demand_u = int(round(power * 0.5 * SOLAR_SCALE))
+        first_hour = max(0, first_slot // TIME_SCALE)
+        last_hour = min(horizon_hours - 1,
+                        (last_slot + duration - 1) // TIME_SCALE)
+        for hour in range(first_hour, last_hour + 1):
+            if hour not in active:
+                continue
+            solar_kw = solar_profile.get(hour % 24, 0)
+            hour_start = hour * TIME_SCALE
+            hour_end = hour_start + TIME_SCALE
+            lo = max(first_slot, hour_start - duration + 1)
+            hi = min(last_slot, hour_end - 1)
+            if hi < lo:
+                continue
+            if collect_demand and per_slot_demand_u > 0:
+                terms = demand_terms[hour]
+                for slot in range(lo, hi + 1):
+                    cnt = (min(slot + duration, hour_end)
+                           - max(slot, hour_start))
+                    terms.append(per_slot_demand_u * cnt * run[(pid, slot)])
+            if solar_kw <= 0:
+                continue
+            per_tick_u = int(round(
+                min(solar_kw, power) * SOLAR_SCALE / TIME_SCALE
+            ))
+            if per_tick_u <= 0:
+                continue
+            for tick in range(hour_start, min(hour_end, horizon_slots)):
+                tick_lo = max(first_slot, tick - duration + 1)
+                tick_hi = min(last_slot, tick)
+                if tick_hi < tick_lo:
+                    continue
+                terms = cap_terms[tick]
+                for start_slot in range(tick_lo, tick_hi + 1):
+                    terms.append(per_tick_u * run[(pid, start_slot)])
+
     used = {}
     demand = {}
     for hour in range(horizon_hours):
         solar_kw = solar_profile.get(hour % 24, 0)
-        pool_u = max(int(round(solar_kw * SOLAR_SCALE)), 0)
-        cap_terms = []
-        demand_terms = []
-        for process in config.processes:
-            pid = process.process_id
-            power = process.power_kw
-            duration = int(process.duration_hours * TIME_SCALE)
-            per_slot_u = int(round(min(solar_kw, power) * 0.5 * SOLAR_SCALE))
-            per_slot_demand_u = int(round(power * 0.5 * SOLAR_SCALE))
-            for slot, cnt in _slots_touching_hour(hour, duration,
-                                                  horizon_slots):
-                run_variable = run.get((pid, slot))
-                if run_variable is not None:
-                    cap_terms.append(per_slot_u * cnt * run_variable)
-                    demand_terms.append(
-                        per_slot_demand_u * cnt * run_variable
-                    )
-        u = model.NewIntVar(0, pool_u, f"solar_used_{hour}")
-        if cap_terms:
-            model.Add(u <= sum(cap_terms, 0))
-        used[hour] = u
-        demand[hour] = sum(demand_terms, 0)
+        slot_uses = []
+        for tick in range(hour * TIME_SCALE,
+                          min((hour + 1) * TIME_SCALE, horizon_slots)):
+            terms = cap_terms.get(tick)
+            pool_u = max(int(round(
+                solar_kw * SOLAR_SCALE / TIME_SCALE
+            )), 0)
+            used_tick = model.new_int_var(
+                0, pool_u if terms else 0, f"solar_used_{tick}"
+            )
+            if terms and pool_u > 0:
+                model.add(used_tick <= _sum_linear_terms(terms))
+            slot_uses.append(used_tick)
+        used[hour] = _sum_linear_terms(slot_uses)
+        hour_demand_terms = demand_terms.get(hour)
+        demand[hour] = (_sum_linear_terms(hour_demand_terms)
+                        if hour_demand_terms else 0)
 
     return used, demand
 
 
-def allocate_solar_greedy(rows, solar_profile, tariff_profile=None):
-    """
-    Deterministic SHARED-SOLAR allocation for reporting.
-
-    Solar is a shared resource: within each clock hour, concurrent processes
-    collectively receive at most the available solar energy. Each running
-    process can additionally draw at most its own power demand over the part
-    of the hour it occupies (supply_kw x overlap_hours). Allocation is greedy
-    in process_id order (deterministic); the hourly pool is never exceeded
-    and no process is credited solar from a time it was not running.
-
-    Args:
-        rows: list of dicts with process_id, start_time, end_time, power_kw
-        solar_profile: hour -> kW (24-hour cyclic)
-        tariff_profile: optional hour -> tariff/kWh; when given, per-row
-            grid cost (grid kWh x hourly tariff) is included
-
-    Returns:
-        dict process_id -> {"solar_kwh", "grid_kwh", "energy_cost"}
-        (energy_cost is 0.0 when no tariff_profile is given)
-    """
-    # Collect running processes per clock hour with their overlap duration
-    running_by_hour = {}
+def _allocate_solar_by_slot(rows, solar_profile, tariff_profile=None,
+                            include_grid_by_slot=False):
+    """Return per-process totals and optionally grid energy per slot."""
+    # Collect running processes per half-hour slot with their overlap.
+    running_by_slot = {}
     for row in rows:
         t = row["start_time"]
         while t < row["end_time"]:
-            hour = int(t)
-            overlap = min(hour + 1, row["end_time"]) - t
-            running_by_hour.setdefault(hour, []).append(
+            slot = int(t * TIME_SCALE)
+            slot_end = (slot + 1) / TIME_SCALE
+            overlap = min(slot_end, row["end_time"]) - t
+            running_by_slot.setdefault(slot, []).append(
                 (row["process_id"], row["power_kw"] * overlap, overlap)
             )
             t += overlap
@@ -609,10 +678,13 @@ def allocate_solar_greedy(rows, solar_profile, tariff_profile=None):
                             "energy_cost": 0.0}
         for row in rows
     }
+    grid_by_slot = {}
 
-    for hour, runners in running_by_hour.items():
+    for slot, runners in running_by_slot.items():
+        hour = slot // TIME_SCALE
         supply_kw = get_solar_availability(hour, solar_profile)
-        supply_kwh = supply_kw * 1.0  # shared pool: one clock hour
+        supply_kwh = supply_kw / TIME_SCALE
+        slot_grid_kwh = 0.0 if include_grid_by_slot else None
         # Deterministic order: process_id
         for pid, demand_kwh, overlap in sorted(runners):
             # Per-process draw cap: the process can only use solar while it
@@ -624,10 +696,28 @@ def allocate_solar_greedy(rows, solar_profile, tariff_profile=None):
             grid_kwh = demand_kwh - solar_kwh
             allocation[pid]["solar_kwh"] += solar_kwh
             allocation[pid]["grid_kwh"] += grid_kwh
+            if include_grid_by_slot:
+                slot_grid_kwh += grid_kwh
             if tariff_profile is not None:
                 allocation[pid]["energy_cost"] += (
                     grid_kwh * get_tariff(hour, tariff_profile)
                 )
+        if include_grid_by_slot:
+            grid_by_slot[slot] = slot_grid_kwh
+    return allocation, grid_by_slot
+
+
+def allocate_solar_greedy(rows, solar_profile, tariff_profile=None):
+    """
+    Deterministic shared-solar allocation for reporting.
+
+    Solar is shared within each half-hour slot and is allocated in
+    process_id order. Returns per-process solar, grid, and optional cost
+    totals without exposing the internal slot breakdown.
+    """
+    allocation, _ = _allocate_solar_by_slot(
+        rows, solar_profile, tariff_profile
+    )
     return allocation
 
 
@@ -635,7 +725,7 @@ def _extract_schedule(config, solver, status_name, start_times, end_times,
                       solar_profile, tariff_profile, with_cost):
     """Build the schedule result dict from a solved model (generic)."""
     # Pass 1: collect scheduled times (shared-solar allocation needs ALL
-    # concurrent processes before splitting the hourly supply)
+    # concurrent processes before splitting each slot's supply)
     times = []
     for process in config.processes:
         times.append((
@@ -657,6 +747,16 @@ def _extract_schedule(config, solver, status_name, start_times, end_times,
         "factory_name": config.factory_name,
         "makespan": max(e for _, _, e in times),
         "solve_time_seconds": round(solver.WallTime(), 4) if solver is not None else None,
+        "solver_diagnostics": {
+            "status": status_name,
+            "best_objective": solver.ObjectiveValue(),
+            "best_bound": solver.BestObjectiveBound(),
+            "optimality_gap": round(
+                abs(solver.ObjectiveValue() - solver.BestObjectiveBound())
+                / max(abs(solver.ObjectiveValue()), 1.0),
+                6,
+            ),
+        },
         "processes": [],
         "total_energy_kwh": 0,
         "total_solar_kwh": 0,
@@ -755,6 +855,10 @@ def create_baseline_schedule(factory_data, solar_profile=None,
             DEMO_TARIFF_PROFILE if tariff_profile is None else tariff_profile,
             with_cost=True,
         )
+    elif status == cp_model.MODEL_INVALID:
+        raise SolverModelInvalidError(
+            "CP-SAT rejected the baseline model as MODEL_INVALID"
+        )
     elif status == cp_model.UNKNOWN:
         raise SolverUnknownError(
             "baseline solve hit the time limit without finding a solution "
@@ -831,14 +935,17 @@ def create_solar_aware_schedule(factory_data, solar_profile=None,
             )
 
     # Objective: maximize total ALLOCATED solar energy under the SHARED
-    # hourly pool (makespan as a secondary tiebreaker). The pool lives
+    # half-hour-slot pool (makespan as a secondary tiebreaker). The pool lives
     # inside the model, so the optimizer sees exactly the physical solar
     # that post-solve reporting allocates.
     planning_horizon = time_to_grid_floor(config.planning_horizon_hours)
 
+    # demand expressions are never consumed by the solar objective, so
+    # the pool builder skips them entirely (identical model semantics).
     share, demand = _add_shared_solar_pool(
         config, model, start_times, profile,
         fixed_start_times=fixed_start_units,
+        collect_demand=False,
     )
 
     # total_solar_score = SUM of allocated solar over ALL hours (0.1 kWh
@@ -870,6 +977,10 @@ def create_solar_aware_schedule(factory_data, solar_profile=None,
             DEMO_TARIFF_PROFILE if tariff_profile is None else tariff_profile,
             with_cost=True,
         )
+    elif status == cp_model.MODEL_INVALID:
+        raise SolverModelInvalidError(
+            "CP-SAT rejected the solar-aware model as MODEL_INVALID"
+        )
     elif status == cp_model.UNKNOWN:
         raise SolverUnknownError(
             "solar-aware solve hit the time limit without finding a solution "
@@ -894,12 +1005,11 @@ def create_cost_optimized_schedule(factory_data, solar_profile=None,
     Create a solar + tariff cost-optimized production schedule (Version 3+).    Primary objective: minimize total electricity cost.
     Secondary objective: minimize makespan (tiebreaker when cost is equal).
 
-    Solar is a SHARED hourly pool inside the model (see
+    Solar is a SHARED half-hour-slot pool inside the model (see
     _add_shared_solar_pool): the in-model energy and cost definitions are
-    exactly the post-solve reporting definitions applied to the hourly
-    pool:
-        solar allocated in an hour <= min(pool supply, total draw caps)
-        grid energy per hour  = total demand - allocated solar
+    exactly the post-solve reporting definitions applied to each slot:
+        solar allocated in a slot <= min(pool supply, total draw caps)
+        grid energy per hour      = total demand - allocated solar
         cost per hour         = grid energy * tariff[hour]
 
     Args:
@@ -957,14 +1067,6 @@ def create_cost_optimized_schedule(factory_data, solar_profile=None,
                 baseline_start_units[process.process_id]
             )
 
-    # Solar is a SHARED hourly pool INSIDE the model (see helper): the cost
-    # objective therefore optimizes against physically available solar, the
-    # same allocation rule post-solve reporting applies.
-    share, demand = _add_shared_solar_pool(
-        config, model, start_times, s_profile,
-        fixed_start_times=fixed_start_units,
-    )
-
     # Objective: minimize total grid electricity cost. Per clock hour:
     #     grid energy = process demand - allocated (shared) solar
     #     cost        = grid energy x tariff[hour]
@@ -974,9 +1076,24 @@ def create_cost_optimized_schedule(factory_data, solar_profile=None,
         hour: int(round(get_tariff(hour, t_profile) * COST_SCALE))
         for hour in range(horizon_hours)
     }
+    # Hours with a zero tariff contribute exactly 0 to the objective, so
+    # the pool builder only constructs demand/share expressions for the
+    # hours below (identical objective, smaller model).
+    active_hours = {hour for hour in range(horizon_hours)
+                    if tariff_mille[hour % 24] != 0}
+
+    # Solar is a SHARED half-hour-slot pool INSIDE the model (see helper): the cost
+    # objective therefore optimizes against physically available solar, the
+    # same allocation rule post-solve reporting applies.
+    share, demand = _add_shared_solar_pool(
+        config, model, start_times, s_profile,
+        fixed_start_times=fixed_start_units,
+        collect_demand=True,
+        active_hours=active_hours,
+    )
     cost_terms = [
         tariff_mille[hour % 24] * (demand[hour] - share[hour])
-        for hour in range(horizon_hours)
+        for hour in sorted(active_hours)
     ]
     total_cost_expr = sum(cost_terms, 0)
 
@@ -1004,6 +1121,10 @@ def create_cost_optimized_schedule(factory_data, solar_profile=None,
             s_profile,
             t_profile,
             with_cost=True,
+        )
+    elif status == cp_model.MODEL_INVALID:
+        raise SolverModelInvalidError(
+            "CP-SAT rejected the cost-optimized model as MODEL_INVALID"
         )
     elif status == cp_model.UNKNOWN:
         raise SolverUnknownError(

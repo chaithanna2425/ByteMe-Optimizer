@@ -26,18 +26,17 @@ def recompute_energy_cost(rows, solar_profile, tariff_profile):
     """
     Independent shared-pool recomputation (does NOT call optimizer helpers).
 
-    Since Phase 4.3 solar is a physically shared hourly resource: within
-    each clock hour, concurrent processes collectively draw at most the
-    available solar; each process draws at most its own demand over the
-    part of the hour it occupies. Split rule: greedy in process_id order.
+    Solar is a physically shared half-hour-slot resource: concurrent
+    processes collectively draw at most slot-available solar. Split rule:
+    greedy in process_id order.
     """
     running = {}
     for row in rows:
         t = row["start_time"]
         while t < row["end_time"]:
-            h = int(t)
-            dur = min(h + 1, row["end_time"]) - t
-            running.setdefault(h, []).append(
+            slot = int(t * 2)
+            dur = min((slot + 1) / 2, row["end_time"]) - t
+            running.setdefault(slot, []).append(
                 (row["process_id"], row["power_kw"] * dur, dur))
             t += dur
 
@@ -45,16 +44,18 @@ def recompute_energy_cost(rows, solar_profile, tariff_profile):
         row["process_id"]: {"solar": 0.0, "grid": 0.0, "cost": 0.0}
         for row in rows
     }
-    for h, runners in running.items():
-        supply = solar_profile.get(h, 0) * 1.0
+    for slot, runners in running.items():
+        hour = (slot // 2) % 24
+        solar_kw = solar_profile.get(hour, 0)
+        supply = solar_kw / 2
         for pid, energy, dur in sorted(runners):
-            draw_cap = solar_profile.get(h, 0) * dur
+            draw_cap = solar_kw * dur
             s = min(energy, draw_cap, max(supply, 0.0))
             supply -= s
             g = energy - s
             result[pid]["solar"] += s
             result[pid]["grid"] += g
-            result[pid]["cost"] += g * tariff_profile.get(h, 0)
+            result[pid]["cost"] += g * tariff_profile.get(hour, 0)
     return result
 
 
@@ -395,6 +396,51 @@ class ConfigValidationTests(unittest.TestCase):
         data["processes"][0]["power_kw"] = -5
         with self.assertRaisesRegex(FactoryConfigError, "power_kw"):
             validate_factory_config(data)
+
+    def test_zero_duration_rejected_by_direct_model_validation(self):
+        data = self._valid()
+        data["processes"][0]["duration_hours"] = 0
+        with self.assertRaisesRegex(FactoryConfigError, "duration_hours must be > 0"):
+            validate_factory_config(data)
+
+    def test_non_finite_horizon_rejected_by_direct_model_validation(self):
+        data = self._valid()
+        data["planning_horizon_hours"] = float("inf")
+        with self.assertRaisesRegex(FactoryConfigError, "finite number"):
+            validate_factory_config(data)
+
+    def test_malformed_process_and_machine_types_are_validation_errors(self):
+        for field, values in (("processes", [None]), ("machines", [None])):
+            with self.subTest(field=field):
+                data = self._valid()
+                data[field] = values
+                with self.assertRaisesRegex(FactoryConfigError, "must be a dict"):
+                    validate_factory_config(data)
+
+    def test_extreme_machine_capacities_are_validation_errors(self):
+        for location in ("process", "machine"):
+            with self.subTest(location=location):
+                data = self._valid()
+                if location == "process":
+                    data["processes"][0]["capacity_units"] = 10**400
+                else:
+                    data["machines"][0]["capacity"] = 10**400
+                with self.assertRaises(FactoryConfigError):
+                    validate_factory_config(data)
+
+    def test_extreme_finite_time_values_are_validation_errors(self):
+        for location in ("duration", "horizon", "deadline"):
+            with self.subTest(location=location):
+                data = self._valid()
+                if location == "duration":
+                    data["processes"][0]["duration_hours"] = 1e308
+                elif location == "horizon":
+                    data["planning_horizon_hours"] = 1e308
+                else:
+                    data["production_deadline"] = 1e308
+                    data["planning_horizon_hours"] = 1e308
+                with self.assertRaises(FactoryConfigError):
+                    validate_factory_config(data)
 
     def test_bad_duration_grid_rejected(self):
         data = self._valid()

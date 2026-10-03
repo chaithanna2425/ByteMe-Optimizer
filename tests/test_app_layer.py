@@ -74,7 +74,7 @@ VALID_INPUT = {
                 "machine_name": "Shared Core Machine",
                 "availability": "single unit",
                 "capacity": 100,
-                "power": 12,
+                "power_kw": 12,
                 "compatible_processes": ["step_x", "step_y"],
             },
             {
@@ -82,7 +82,7 @@ VALID_INPUT = {
                 "machine_name": "Polishing Bench",
                 "availability": "single unit",
                 "capacity": 50,
-                "power": 4,
+                "power_kw": 4,
                 "compatible_processes": ["step_z"],
             },
         ],
@@ -157,6 +157,10 @@ class InvalidInputTests(unittest.TestCase):
         with self.assertRaises(InputValidationError) as ctx:
             validate_user_input(data)
         return ctx.exception
+
+    def test_duplicate_json_properties_are_rejected_by_input_loader(self):
+        with self.assertRaisesRegex(InputValidationError, "duplicate property"):
+            load_user_input('{"factory": {}, "factory": {}}')
 
     def test_duplicate_process_id(self):
         exc = self._invalid(lambda d: d["factory"]["processes"][1].update(
@@ -246,6 +250,11 @@ class WorkflowTests(unittest.TestCase):
             result = app.run_optimization(config, objective=objective)
             self.assertIsNotNone(result)
             self.assertEqual(result["status"], "OPTIMAL")
+
+    def test_optimization_rejects_unknown_objective(self):
+        config = validate_user_input(copy.deepcopy(VALID_INPUT))
+        with self.assertRaisesRegex(InputValidationError, "objective"):
+            app.run_optimization(config, objective="solr")
 
     def test_workflow_valid_input_end_to_end(self):
         result = app.run_workflow(copy.deepcopy(VALID_INPUT))
@@ -430,6 +439,57 @@ class SerializationAndDisplayTests(unittest.TestCase):
         for expected in ("BASELINE SCHEDULE", "OPTIMIZED SCHEDULE",
                          "ENERGY PROFILE", "ENERGY / COST COMPARISON"):
             self.assertIn(expected, output)
+
+    def test_energy_profile_wraps_solar_after_24_hours(self):
+        import contextlib
+        import io
+
+        profile = {hour: (7 if hour == 0 else 0) for hour in range(24)}
+        schedule = {
+            "factory_name": "Long Horizon",
+            "processes": [{
+                "process_id": "overnight",
+                "start_time": 24,
+                "end_time": 25,
+                "power_kw": 1,
+            }],
+        }
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            render_energy_profile(profile, schedule)
+
+        hour_24 = next(
+            line for line in buffer.getvalue().splitlines()
+            if line.startswith("24 ")
+        )
+        self.assertIn("7.0", hour_24)
+
+    def test_energy_profile_uses_exact_hourly_solar_allocation(self):
+        import contextlib
+        import io
+
+        profile = {hour: 0 for hour in range(24)}
+        profile[11] = 10
+        schedule = {
+            "factory_name": "Solar Transition",
+            "processes": [{
+                "process_id": "crossing",
+                "start_time": 10.5,
+                "end_time": 11.5,
+                "power_kw": 10,
+            }],
+        }
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            render_energy_profile(profile, schedule)
+
+        rows = {
+            int(line.split()[0]): line
+            for line in buffer.getvalue().splitlines()
+            if line.startswith(("10 ", "11 "))
+        }
+        self.assertEqual(rows[10][53:62].strip(), "5.00")
+        self.assertEqual(rows[11][53:62].strip(), "0.00")
 
 
 class GenericityTests(unittest.TestCase):

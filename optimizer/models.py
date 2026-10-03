@@ -15,6 +15,7 @@ All data handled here is DEMO/SIMULATED data only.
 import math
 
 TIME_SCALE = 2  # 1 scheduling unit = 0.5 hours (half-hour precision)
+MAX_CP_SAT_INTEGER = (1 << 63) - 1
 
 # ---------------------------------------------------------------------------
 # Integer-scaling bounds of the CP-SAT model (documented contract).
@@ -176,14 +177,26 @@ def _require(condition, message):
 
 def _require_number(factory_name, where, name, value, minimum=None):
     _require(
-        isinstance(value, (int, float)) and not isinstance(value, bool),
-        f"{factory_name}: {where}.{name} must be a number, got {value!r}",
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and _is_finite_real(value),
+        f"{factory_name}: {where}.{name} must be a finite number, got {value!r}",
     )
     if minimum is not None:
         _require(
             value >= minimum,
             f"{factory_name}: {where}.{name} must be >= {minimum}, got {value}",
         )
+
+
+def _require_grid_time(factory_name, where, name, value, minimum=None):
+    _require_number(factory_name, where, name, value, minimum)
+    scaled_value = value * TIME_SCALE
+    _require(
+        _is_finite_real(scaled_value) and scaled_value <= MAX_CP_SAT_INTEGER,
+        f"{factory_name}: {where}.{name} is outside the supported "
+        "CP-SAT time domain",
+    )
 
 
 def _require_id_value(factory_name, where, name, value):
@@ -193,12 +206,25 @@ def _require_id_value(factory_name, where, name, value):
     )
 
 
+def _is_positive_cp_sat_integer(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 1 <= value <= MAX_CP_SAT_INTEGER
+    return (
+        isinstance(value, float)
+        and math.isfinite(value)
+        and value.is_integer()
+        and 1 <= value <= MAX_CP_SAT_INTEGER
+    )
+
+
 class ProcessSpec:
     """Generic process definition (all values DEMO/SIMULATED)."""
 
     def __init__(self, data, factory_name="factory"):
+        _require(isinstance(data, dict), f"{factory_name}: process must be a dict")
         where = f"process {data.get('process_id', '<missing id>')!r}"
-        _require(isinstance(data, dict), f"{factory_name}: {where} must be a dict")
 
         # --- identity ---
         self.process_id = data.get("process_id")
@@ -212,12 +238,16 @@ class ProcessSpec:
             "duration_hours" in data and "power_kw" in data,
             f"{factory_name}: {where} requires 'duration_hours' and 'power_kw'",
         )
-        _require_number(
+        _require_grid_time(
             factory_name, where, "duration_hours", data["duration_hours"], minimum=0
         )
         _require_number(factory_name, where, "power_kw", data["power_kw"], minimum=0)
         self.duration_hours = data["duration_hours"]
         self.power_kw = data["power_kw"]
+        _require(
+            self.duration_hours > 0,
+            f"{factory_name}: {where}.duration_hours must be > 0",
+        )
 
         # --- generic scheduling constraints ---
         deps = data.get("dependencies", [])
@@ -246,13 +276,13 @@ class ProcessSpec:
 
         # Optional time-window constraints, in hours.
         if "earliest_start" in data and data["earliest_start"] is not None:
-            _require_number(
+            _require_grid_time(
                 factory_name, where, "earliest_start", data["earliest_start"], minimum=0
             )
         self.earliest_start = data.get("earliest_start")
 
         if "latest_finish" in data and data["latest_finish"] is not None:
-            _require_number(
+            _require_grid_time(
                 factory_name, where, "latest_finish", data["latest_finish"], minimum=0
             )
         self.latest_finish = data.get("latest_finish")
@@ -266,17 +296,9 @@ class ProcessSpec:
         )
         self.capacity_units = data.get("capacity_units", 1)
         _require(
-            isinstance(self.capacity_units, (int, float))
-            and not isinstance(self.capacity_units, bool)
-            and math.isfinite(self.capacity_units)
-            and self.capacity_units >= 1,
+            _is_positive_cp_sat_integer(self.capacity_units),
             f"{factory_name}: {where}.capacity_units must be a positive "
-            f"integer, got {self.capacity_units!r}",
-        )
-        _require(
-            float(self.capacity_units).is_integer(),
-            f"{factory_name}: {where}.capacity_units must be a positive "
-            f"integer, got {self.capacity_units!r}",
+            f"CP-SAT integer, got {self.capacity_units!r}",
         )
         self.capacity_units = int(self.capacity_units)
 
@@ -300,8 +322,8 @@ class MachineSpec:
     """Generic machine/resource definition (all values DEMO/SIMULATED)."""
 
     def __init__(self, data, factory_name="factory"):
+        _require(isinstance(data, dict), f"{factory_name}: machine must be a dict")
         where = f"machine {data.get('machine_id', '<missing id>')!r}"
-        _require(isinstance(data, dict), f"{factory_name}: {where} must be a dict")
 
         self.machine_id = data.get("machine_id")
         _require_id_value(factory_name, where, "machine_id", self.machine_id)
@@ -315,12 +337,10 @@ class MachineSpec:
         capacity = data.get("capacity", 1)
         if capacity is not None:
             _require(
-                isinstance(capacity, (int, float))
-                and not isinstance(capacity, bool)
-                and float(capacity).is_integer()
-                and capacity >= 1,
+                _is_positive_cp_sat_integer(capacity),
                 f"{factory_name}: {where}.capacity must be a whole number "
-                f">= 1 (max simultaneous processes), got {capacity!r}",
+                f"between 1 and {MAX_CP_SAT_INTEGER} (max simultaneous "
+                f"capacity units), got {capacity!r}",
             )
         self.capacity = int(capacity) if capacity is not None else 1
         self.availability = data.get("availability", "unspecified")
@@ -371,14 +391,14 @@ class FactoryConfig:
             f"{self.factory_name}: requires 'planning_horizon_hours' and "
             f"'production_deadline'",
         )
-        _require_number(
+        _require_grid_time(
             factory_name,
             "factory",
             "planning_horizon_hours",
             data["planning_horizon_hours"],
             minimum=0,
         )
-        _require_number(
+        _require_grid_time(
             factory_name,
             "factory",
             "production_deadline",
@@ -387,6 +407,14 @@ class FactoryConfig:
         )
         self.planning_horizon_hours = data["planning_horizon_hours"]
         self.production_deadline = data["production_deadline"]
+        _require(
+            self.planning_horizon_hours > 0,
+            f"{self.factory_name}: factory.planning_horizon_hours must be > 0",
+        )
+        _require(
+            self.production_deadline > 0,
+            f"{self.factory_name}: factory.production_deadline must be > 0",
+        )
         _require(
             self.production_deadline <= self.planning_horizon_hours,
             f"{self.factory_name}: production_deadline "

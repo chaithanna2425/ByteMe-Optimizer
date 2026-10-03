@@ -16,6 +16,7 @@ from optimizer.energy_data import DEMO_SOLAR_PROFILE, DEMO_TARIFF_PROFILE
 from optimizer.models import (
     COST_DOMAIN_LIMIT,
     COST_SCALE,
+    MAX_CP_SAT_INTEGER,
     SOLAR_DOMAIN_LIMIT,
     SOLAR_SCALE,
     FactoryConfig,
@@ -48,6 +49,41 @@ class InputValidationError(Exception):
         super().__init__("; ".join(self.problems))
 
 
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise InputValidationError([
+                f"JSON object contains duplicate property {key!r}"
+            ])
+        result[key] = value
+    return result
+
+
+def _parse_json(text):
+    """Parse JSON while rejecting duplicate keys and oversized integers."""
+    try:
+        return json.loads(text, object_pairs_hook=_unique_json_object)
+    except json.JSONDecodeError:
+        raise
+    except RecursionError as exc:
+        raise InputValidationError([
+            "JSON input is nested too deeply to parse"
+        ]) from exc
+    except ValueError as exc:
+        raise InputValidationError([f"Invalid JSON input: {exc}"]) from exc
+
+
+def _read_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return _parse_json(handle.read())
+    except UnicodeDecodeError as exc:
+        raise InputValidationError([
+            "JSON input file must contain valid UTF-8 text"
+        ]) from exc
+
+
 def _add_problem(problems, message):
     problems.append(message)
 
@@ -66,7 +102,17 @@ def _is_finite_number(value):
         return False
 
 
-def _normalize_profile_hours(profile):
+def _fits_cp_sat_time_domain(value):
+    if not _is_finite_number(value):
+        return False
+    scaled_value = value * TIME_SCALE
+    return (
+        _is_finite_number(scaled_value)
+        and scaled_value <= MAX_CP_SAT_INTEGER
+    )
+
+
+def _normalize_profile_hours(profile, profile_name):
     """
     Normalize profile hour keys to integers.
 
@@ -80,7 +126,18 @@ def _normalize_profile_hours(profile):
     normalized = {}
     for hour, value in profile.items():
         if isinstance(hour, str) and hour.strip().lstrip("-").isdigit():
-            hour = int(hour.strip())
+            try:
+                hour = int(hour.strip())
+            except ValueError as exc:
+                raise InputValidationError([
+                    f"energy.{profile_name} contains an hour key that is "
+                    "too large to parse"
+                ]) from exc
+        if hour in normalized:
+            raise InputValidationError([
+                f"energy.{profile_name} contains duplicate hour keys after "
+                f"normalization: {hour!r}"
+            ])
         normalized[hour] = value
     return normalized
 
@@ -214,10 +271,22 @@ def validate_user_input(data):
     if not isinstance(factory, dict):
         _add_problem(problems, "'factory' section is missing or not an object")
         factory = {}
+    else:
+        allowed_factory_fields = {
+            "factory_id", "factory_name", "factory_type",
+            "planning_horizon_hours", "production_deadline",
+            "processes", "machines",
+        }
+        for key in factory:
+            if key not in allowed_factory_fields:
+                _add_problem(problems, f"unknown factory field {key!r}")
 
     factory_name = factory.get("factory_name")
     if not isinstance(factory_name, str) or not factory_name:
         _add_problem(problems, "factory.factory_name must be a non-empty string")
+    factory_id = factory.get("factory_id")
+    if factory_id is not None and (not isinstance(factory_id, str) or not factory_id):
+        _add_problem(problems, "factory.factory_id must be a non-empty string")
 
     horizon = factory.get("planning_horizon_hours")
     if not _is_finite_number(horizon) or horizon <= 0:
@@ -226,6 +295,12 @@ def validate_user_input(data):
             "factory.planning_horizon_hours must be a positive finite number "
             f"(no NaN/Infinity), got {horizon!r}",
         )
+    elif not _fits_cp_sat_time_domain(horizon):
+        _add_problem(
+            problems,
+            "factory.planning_horizon_hours exceeds the supported CP-SAT "
+            "time domain",
+        )
 
     deadline = factory.get("production_deadline")
     if not _is_finite_number(deadline) or deadline <= 0:
@@ -233,6 +308,12 @@ def validate_user_input(data):
             problems,
             "factory.production_deadline must be a positive finite number "
             f"(no NaN/Infinity), got {deadline!r}",
+        )
+    elif not _fits_cp_sat_time_domain(deadline):
+        _add_problem(
+            problems,
+            "factory.production_deadline exceeds the supported CP-SAT "
+            "time domain",
         )
 
     processes = factory.get("processes")
@@ -253,6 +334,18 @@ def validate_user_input(data):
         if not isinstance(proc, dict):
             _add_problem(problems, f"processes[{index}] must be an object")
             continue
+        allowed_process_fields = {
+            "process_id", "work_order_id", "process_name", "duration_hours",
+            "power_kw", "quantity", "quantity_unit", "dependencies",
+            "is_flexible", "machine_id", "capacity_units", "earliest_start",
+            "latest_finish",
+        }
+        for key in proc:
+            if key not in allowed_process_fields:
+                _add_problem(
+                    problems,
+                    f"processes[{index}]: unknown field {key!r}",
+                )
 
         pid = proc.get("process_id")
         if not isinstance(pid, str) or not pid:
@@ -261,6 +354,22 @@ def validate_user_input(data):
             _add_problem(problems, f"duplicate process_id '{pid}'")
         else:
             process_ids.add(pid)
+
+        for field in ("work_order_id", "quantity_unit"):
+            value = proc.get(field)
+            if value is not None and not isinstance(value, str):
+                _add_problem(
+                    problems,
+                    f"process '{pid or index}': {field} must be a string or null",
+                )
+
+        process_name = proc.get("process_name")
+        if process_name is not None and (
+                not isinstance(process_name, str) or not process_name):
+            _add_problem(
+                problems,
+                f"process '{pid or index}': process_name must be a non-empty string",
+            )
 
         duration = proc.get("duration_hours")
         if not _is_finite_number(duration) or duration < 0:
@@ -272,6 +381,12 @@ def validate_user_input(data):
         elif duration == 0:
             _add_problem(
                 problems, f"process '{pid or index}': duration_hours must be > 0"
+            )
+        elif not _fits_cp_sat_time_domain(duration):
+            _add_problem(
+                problems,
+                f"process '{pid or index}': duration_hours exceeds the "
+                "supported CP-SAT time domain",
             )
         elif (duration * TIME_SCALE) != int(duration * TIME_SCALE):
             _add_problem(
@@ -328,6 +443,14 @@ def validate_user_input(data):
                 f"integer, got {capacity_units!r}",
             )
 
+        machine_id = proc.get("machine_id")
+        if machine_id is not None and (
+                not isinstance(machine_id, str) or not machine_id):
+            _add_problem(
+                problems,
+                f"process '{pid or index}': machine_id must be a non-empty string or null",
+            )
+
         for field in ("earliest_start", "latest_finish"):
             if proc.get(field) is not None:
                 value = proc[field]
@@ -337,6 +460,12 @@ def validate_user_input(data):
                         f"process '{pid or index}': {field} must be a finite "
                         f"number >= 0 (no NaN/Infinity), got {value!r}",
                     )
+                elif not _fits_cp_sat_time_domain(value):
+                    _add_problem(
+                        problems,
+                        f"process '{pid or index}': {field} exceeds the "
+                        "supported CP-SAT time domain",
+                    )
 
     # ---- machine-level checks -------------------------------------------
     machine_ids = set()
@@ -344,6 +473,16 @@ def validate_user_input(data):
         if not isinstance(machine, dict):
             _add_problem(problems, f"machines[{index}] must be an object")
             continue
+        allowed_machine_fields = {
+            "machine_id", "machine_name", "availability", "capacity",
+            "power_kw", "compatible_processes",
+        }
+        for key in machine:
+            if key not in allowed_machine_fields:
+                _add_problem(
+                    problems,
+                    f"machines[{index}]: unknown field {key!r}",
+                )
 
         mid = machine.get("machine_id")
         if not isinstance(mid, str) or not mid:
@@ -442,10 +581,12 @@ def validate_user_input(data):
         if earliest is None:
             earliest = 0
         latest = proc.get("latest_finish")
-        if (_is_finite_number(earliest) and _is_finite_number(duration)
-                and _is_finite_number(deadline)
-                and _is_finite_number(horizon)
-                and (latest is None or _is_finite_number(latest))):
+        if (_fits_cp_sat_time_domain(earliest)
+                and _fits_cp_sat_time_domain(duration)
+                and _fits_cp_sat_time_domain(deadline)
+                and _fits_cp_sat_time_domain(horizon)
+                and (latest is None
+                     or _fits_cp_sat_time_domain(latest))):
             finish_limit = latest if latest is not None else deadline
             if (time_to_grid_ceil(earliest)
                     + int(round(duration * TIME_SCALE))
@@ -465,8 +606,8 @@ def validate_user_input(data):
     emission_factor = energy.get("grid_emission_factor")
 
     # JSON keys are strings: normalize "0" -> 0 before validating/using
-    solar_profile = _normalize_profile_hours(solar_profile)
-    tariff_profile = _normalize_profile_hours(tariff_profile)
+    solar_profile = _normalize_profile_hours(solar_profile, "solar_profile")
+    tariff_profile = _normalize_profile_hours(tariff_profile, "tariff_profile")
 
     _validate_energy_profiles(
         solar_profile, tariff_profile, emission_factor, problems, warnings
@@ -587,18 +728,18 @@ def load_user_input(source):
     Load user input from a JSON file path, a JSON string, or a dict.
 
     Returns a validated FactoryConfig with attached energy data.
-    Raises InputValidationError on invalid input, json.JSONDecodeError on
-    malformed JSON, OSError on unreadable files.
+    Raises InputValidationError on schema, duplicate-property, oversized
+    numeric, or encoding errors; json.JSONDecodeError on malformed JSON
+    syntax; OSError on unreadable files.
     """
     if isinstance(source, dict):
         data = source
     elif isinstance(source, str):
         text = source.strip()
         if text.startswith("{"):
-            data = json.loads(text)
+            data = _parse_json(text)
         else:
-            with open(text, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
+            data = _read_json_file(text)
     else:
         raise InputValidationError([
             f"Unsupported input source type: {type(source).__name__} "

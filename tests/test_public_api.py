@@ -7,6 +7,8 @@ the full error taxonomy, contract stability, and JSON round trips.
 """
 
 import copy
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -24,8 +26,9 @@ from optimizer.public_api import (
     STATUS_UNKNOWN,
     OptimizerInputError,
     optimize,
+    optimize_request,
 )
-from optimizer.optimizer import SolverUnknownError
+from optimizer.optimizer import SolverModelInvalidError, SolverUnknownError
 
 try:
     import jsonschema
@@ -265,10 +268,13 @@ class OptimizeInvalidInputTests(unittest.TestCase):
         data["factory"]["production_deadline"] = 2
         result = optimize(data)
         self.assertEqual(result["status"], STATUS_INFEASIBLE)
+        self.assertEqual(result["error_category"], "INFEASIBLE")
         self.assertIsNone(result["result"]["optimized"])
         self.assertIsInstance(result["result"]["solve_time_seconds"], (int, float))
         self.assertGreaterEqual(result["result"]["solve_time_seconds"], 0)
         self.assertIsNone(result["errors"])
+        if _HAS_JSONSCHEMA:
+            jsonschema.validate(result, public_api.get_output_schema())
 
     def test_operational_warnings_match_their_conditions(self):
         flat = copy.deepcopy(VALID_WIDGET)
@@ -312,6 +318,17 @@ class OptimizeInvalidInputTests(unittest.TestCase):
         self.assertTrue(any("uniform across the planning horizon" in w
                             for w in result["warnings"]))
 
+    def test_unknown_status_preserves_factory_name_for_json_input(self):
+        with patch(
+                "optimizer.public_api.create_baseline_schedule",
+                side_effect=SolverUnknownError("test limit", 0.125)):
+            result = optimize(json.dumps(VALID_WIDGET))
+
+        self.assertEqual(result["status"], STATUS_UNKNOWN)
+        self.assertEqual(
+            result["result"]["factory_name"], "Demo Widget Lab"
+        )
+
     def test_unknown_optimization_preserves_successful_baseline(self):
         with patch(
                 "optimizer.public_api.create_cost_optimized_schedule",
@@ -330,6 +347,48 @@ class OptimizeInvalidInputTests(unittest.TestCase):
                             for warning in payload["warnings"]))
         if _HAS_JSONSCHEMA:
             jsonschema.validate(result, public_api.get_output_schema())
+
+    def test_model_invalid_is_reported_as_internal_error(self):
+        from ortools.sat.python import cp_model
+
+        class InvalidModelSolver:
+            def Solve(self, model):
+                return cp_model.MODEL_INVALID
+
+        with patch("optimizer.optimizer._new_solver",
+                   return_value=InvalidModelSolver()):
+            result = optimize(copy.deepcopy(VALID_WIDGET))
+
+        self.assertEqual(result["status"], STATUS_ERROR)
+        self.assertEqual(result["error_category"], "INTERNAL_ERROR")
+        self.assertIn("SolverModelInvalidError", result["errors"][0])
+
+    def test_engine_raises_for_model_invalid_in_every_solver_stage(self):
+        from ortools.sat.python import cp_model
+        from optimizer.optimizer import (
+            create_baseline_schedule,
+            create_cost_optimized_schedule,
+            create_solar_aware_schedule,
+        )
+
+        class InvalidModelSolver:
+            def Solve(self, model):
+                return cp_model.MODEL_INVALID
+
+        factory = copy.deepcopy(VALID_WIDGET["factory"])
+        with patch("optimizer.optimizer._new_solver",
+                   return_value=InvalidModelSolver()):
+            with self.assertRaises(SolverModelInvalidError):
+                create_baseline_schedule(factory)
+
+        baseline = create_baseline_schedule(factory)
+        with patch("optimizer.optimizer._new_solver",
+                   return_value=InvalidModelSolver()):
+            for runner in (create_cost_optimized_schedule,
+                           create_solar_aware_schedule):
+                with self.subTest(runner=runner.__name__):
+                    with self.assertRaises(SolverModelInvalidError):
+                        runner(factory, baseline_schedule=baseline)
 
     def test_earliest_start_rounds_up_to_the_half_hour_grid(self):
         data = copy.deepcopy(VALID_WIDGET)
@@ -494,6 +553,98 @@ class OptimizeInvalidInputTests(unittest.TestCase):
                 self.assertIsNone(result["result"])
                 solve.assert_not_called()
 
+    def test_energy_profile_keys_colliding_after_normalization_are_rejected(self):
+        for profile_name in ("solar_profile", "tariff_profile"):
+            with self.subTest(profile=profile_name):
+                data = copy.deepcopy(VALID_WIDGET)
+                data["energy"][profile_name] = {
+                    "1": 0.2,
+                    "01": 0.4,
+                }
+                with patch(
+                        "optimizer.public_api.create_baseline_schedule") as solve:
+                    result = optimize(json.dumps(data))
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                self.assertTrue(any(
+                    profile_name in error and "duplicate hour keys" in error
+                    for error in result["errors"]
+                ))
+                solve.assert_not_called()
+
+    def test_oversized_numeric_input_is_invalid_without_traceback(self):
+        import contextlib
+        import io
+
+        huge_digits = "9" * 5000
+        oversized_profile = copy.deepcopy(VALID_WIDGET)
+        oversized_profile["energy"]["solar_profile"] = {huge_digits: 1}
+        oversized_json = json.dumps(VALID_WIDGET).replace(
+            '"planning_horizon_hours": 18',
+            f'"planning_horizon_hours": {huge_digits}',
+        )
+        deeply_nested_json = (
+            '{"factory":' + "[" * 1500 + "0" + "]" * 1500 + "}"
+        )
+
+        for source in (oversized_profile, oversized_json, deeply_nested_json):
+            with self.subTest(source_type=type(source).__name__):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = optimize(source)
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                self.assertIsNone(result["result"])
+                self.assertTrue(result["errors"])
+                self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_extreme_finite_time_inputs_are_invalid(self):
+        for field in ("planning_horizon_hours", "production_deadline",
+                      "duration_hours", "earliest_start", "latest_finish"):
+            with self.subTest(field=field):
+                data = copy.deepcopy(VALID_WIDGET)
+                target = (data["factory"] if field in (
+                    "planning_horizon_hours", "production_deadline"
+                ) else data["factory"]["processes"][0])
+                target[field] = 1e308
+                if field in ("planning_horizon_hours", "production_deadline"):
+                    data["factory"]["planning_horizon_hours"] = 1e308
+                    data["factory"]["production_deadline"] = 1e308
+                with patch(
+                        "optimizer.public_api.create_baseline_schedule") as solve:
+                    result = optimize(data)
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                self.assertTrue(result["errors"])
+                self.assertIsNone(result["result"])
+                solve.assert_not_called()
+
+    def test_duplicate_json_properties_are_rejected(self):
+        raw = json.dumps(VALID_WIDGET).replace(
+            '"factory_name": "Demo Widget Lab"',
+            '"factory_name": "Other", "factory_name": "Demo Widget Lab"',
+            1,
+        )
+        with patch("optimizer.public_api.create_baseline_schedule") as solve:
+            result = optimize(raw)
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertIsNone(result["result"])
+        self.assertTrue(any("duplicate property" in error
+                            for error in result["errors"]))
+        solve.assert_not_called()
+
+    def test_invalid_utf8_json_file_is_invalid_input_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "invalid.json")
+            with open(path, "wb") as handle:
+                handle.write(b'{"factory":\xff}')
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                result = optimize(path)
+
+        self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertIsNone(result["result"])
+        self.assertTrue(any("UTF-8" in error for error in result["errors"]))
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_options_are_validated_against_the_declared_contract(self):
         invalid_options = (
             None,
@@ -518,6 +669,66 @@ class OptimizeInvalidInputTests(unittest.TestCase):
         data = copy.deepcopy(VALID_WIDGET)
         data["options"] = {"objective": "solar", "max_time_seconds": None}
         self.assertEqual(optimize(data)["status"], STATUS_OPTIMAL)
+
+    def test_runtime_rejects_nested_types_rejected_by_schema(self):
+        changes = (
+            ("factory", "factory_id", 7),
+            ("process", "work_order_id", 7),
+            ("process", "quantity_unit", 7),
+            ("process", "process_name", ""),
+            ("process", "machine_id", 7),
+        )
+        for scope, field, value in changes:
+            data = copy.deepcopy(VALID_WIDGET)
+            target = (data["factory"] if scope == "factory" else
+                      data["factory"]["processes"][0])
+            target[field] = value
+            with self.subTest(scope=scope, field=field):
+                result = optimize(data)
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                if _HAS_JSONSCHEMA:
+                    with self.assertRaises(jsonschema.ValidationError):
+                        jsonschema.validate(data, public_api.get_input_schema())
+
+    def test_partial_profiles_zero_missing_hours_and_schema_agrees(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["energy"]["solar_profile"] = {0: 0}
+        data["energy"]["tariff_profile"] = {0: 0.45}
+        if _HAS_JSONSCHEMA:
+            jsonschema.validate(data, public_api.get_input_schema())
+        result = optimize(data)
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        self.assertTrue(any("does not define hours" in warning
+                            for warning in result["warnings"]))
+        for row in result["result"]["optimized"]["processes"]:
+            expected = 0.45 if row["start_time"] < 1 else 0
+            self.assertEqual(row["tariff"], expected)
+
+    def test_timeout_is_per_solver_stage_and_unknown_is_not_internal_error(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["options"] = {"max_time_seconds": 0.25}
+        with patch("optimizer.public_api.create_cost_optimized_schedule",
+                   side_effect=SolverUnknownError("time", 0.25)):
+            result = optimize(data, strict=True)
+        self.assertEqual(result["status"], STATUS_UNKNOWN)
+        self.assertIsNone(result["error_category"])
+        self.assertNotEqual(result["status"], STATUS_ERROR)
+
+    def test_timeout_value_is_forwarded_to_each_solver_stage(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        data["options"] = {"max_time_seconds": 0.375}
+        with patch("optimizer.public_api.create_baseline_schedule",
+                   wraps=public_api.create_baseline_schedule) as baseline, \
+                patch("optimizer.public_api.create_cost_optimized_schedule",
+                      wraps=public_api.create_cost_optimized_schedule) as optimized:
+            result = optimize(data)
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        self.assertEqual(
+            baseline.call_args.kwargs["max_time_seconds"], 0.375
+        )
+        self.assertEqual(
+            optimized.call_args.kwargs["max_time_seconds"], 0.375
+        )
 
     def test_schema_invalid_shapes_never_reach_solver(self):
         invalid_sources = []
@@ -574,6 +785,33 @@ class OptimizeInvalidInputTests(unittest.TestCase):
         result = optimize(data)
         self.assertEqual(result["status"], STATUS_INVALID_INPUT)
 
+    def test_nested_schema_and_runtime_reject_the_same_unknown_fields(self):
+        cases = []
+        factory_extra = copy.deepcopy(VALID_WIDGET)
+        factory_extra["factory"]["unexpected_factory_field"] = "x"
+        cases.append(factory_extra)
+
+        process_extra = copy.deepcopy(VALID_WIDGET)
+        process_extra["factory"]["processes"][0]["unexpected_process_field"] = "x"
+        cases.append(process_extra)
+
+        machine_extra = copy.deepcopy(VALID_WIDGET)
+        machine_extra["factory"]["machines"][0]["unexpected_machine_field"] = "x"
+        cases.append(machine_extra)
+
+        zero_duration = copy.deepcopy(VALID_WIDGET)
+        zero_duration["factory"]["processes"][0]["duration_hours"] = 0
+        cases.append(zero_duration)
+
+        for data in cases:
+            with self.subTest(data=data):
+                result = optimize(data)
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                self.assertIsNone(result["result"])
+                if _HAS_JSONSCHEMA:
+                    with self.assertRaises(jsonschema.ValidationError):
+                        jsonschema.validate(data, public_api.get_input_schema())
+
         data = copy.deepcopy(VALID_WIDGET)
         data["energy"]["time_zone"] = "UTC"
         result = optimize(data)
@@ -592,6 +830,19 @@ class OptimizeInvalidInputTests(unittest.TestCase):
     def test_unsupported_source_type(self):
         result = optimize(12345)
         self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+        self.assertEqual(result["error_category"], "VALIDATION_ERROR")
+
+    def test_service_api_accepts_only_parsed_objects(self):
+        for source in ("{}", "definitely_missing_service_path.json", None):
+            with self.subTest(source=source):
+                result = optimize_request(source)
+                self.assertEqual(result["status"], STATUS_INVALID_INPUT)
+                self.assertEqual(result["error_category"], "VALIDATION_ERROR")
+                self.assertTrue(result["errors"])
+        self.assertEqual(
+            optimize_request(copy.deepcopy(VALID_WIDGET))["status"],
+            STATUS_OPTIMAL,
+        )
 
     def test_no_stack_traces_in_result(self):
         result = optimize("{broken json")
@@ -611,10 +862,11 @@ class ContractStabilityTests(unittest.TestCase):
         result = optimize(copy.deepcopy(VALID_WIDGET))
         self.assertEqual(
             set(result.keys()),
-            {"api_version", "status", "result", "errors", "warnings"},
+            {"api_version", "status", "result", "errors", "warnings",
+             "error_category"},
         )
         self.assertIsInstance(result["warnings"], list)
-        self.assertEqual(result["api_version"], "1.0")
+        self.assertEqual(result["api_version"], "2.0")
         payload = result["result"]
         for key in ("status", "factory_name", "objective", "baseline",
                     "optimized", "comparison", "machine_utilization",
@@ -633,6 +885,9 @@ class ContractStabilityTests(unittest.TestCase):
                     "power_kw", "is_flexible", "machine_id", "solar_kwh",
                     "grid_kwh", "energy_cost", "tariff"):
             self.assertIn(key, row)
+        diagnostics = payload["optimized"]["solver_diagnostics"]
+        self.assertEqual(diagnostics["status"], payload["optimized"]["status"])
+        self.assertGreaterEqual(diagnostics["optimality_gap"], 0)
 
     def test_schema_accessors(self):
         input_schema = public_api.get_input_schema()

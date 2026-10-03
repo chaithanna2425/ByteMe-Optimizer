@@ -27,7 +27,9 @@ PROCESS (generic - all scheduling-relevant fields):
     is_flexible       True if the process may be shifted by the optimizer,
                       False if it is pinned to its baseline (plan) start time
     machine_id        optional machine/resource requirement (must exist in
-                      "machines"); processes sharing a machine never overlap
+                      "machines"); processes share its enforced capacity
+    capacity_units    optional positive machine-capacity demand (default 1);
+                      requires machine_id when greater than 1
     quantity          optional production quantity / batch size (informational)
     earliest_start    optional earliest allowed start (hours)
     latest_finish     optional latest allowed end (hours)
@@ -35,8 +37,9 @@ PROCESS (generic - all scheduling-relevant fields):
 MACHINE (generic resource):
     machine_id            unique id
     machine_name          display name
-    capacity              REAL constraint: max processes running at once
-                          (1 = never overlaps; >= 2 = allowed parallelism).
+    capacity              REAL constraint: maximum simultaneous capacity
+                          units. Processes may overlap when their combined
+                          `capacity_units` do not exceed this value.
                           Batch sizes belong on processes as `quantity`.
     availability          informational availability description (DEMO)
     compatible_processes  process_ids this machine can run (DEMO metadata)

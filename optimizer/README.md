@@ -27,7 +27,7 @@ GENERIC PROCESS/MACHINE MODEL                   optimizer/models.py
         v
 GENERIC PRODUCTION CONSTRAINTS
         |  durations, dependencies, deadlines, time windows,
-        |  flexible/non-flexible pinning, machine NoOverlap
+        |  flexible/non-flexible pinning, machine capacity
         v
 OR-TOOLS CP-SAT OPTIMIZATION ENGINE             optimizer/optimizer.py
         |  V1 baseline | V2 solar-aware | V3/V4 cost-optimized
@@ -60,11 +60,11 @@ A factory is pure data following the generic schema:
       "power_kw": 10,                    # constant power while running
       "quantity": 100,                   # informational only; not optimized
       "dependencies": [],                # process_ids that must finish first
-      "is_flexible": false,              # False = pinned to baseline start
+      "is_flexible": False,              # False = pinned to baseline start
       "machine_id": "core",              # optional machine requirement
       "capacity_units": 1,               # optional machine demand; defaults to 1
-      "earliest_start": null,            # optional time window (hours)
-      "latest_finish": null              # optional time window (hours)
+      "earliest_start": None,            # optional time window (hours)
+      "latest_finish": None              # optional time window (hours)
     }
   ],
   "machines": [
@@ -82,21 +82,38 @@ A factory is pure data following the generic schema:
 
 Rules: `duration_hours` on the half-hour grid; `dependencies` must reference
 existing processes and be cycle-free; `machine_id` must exist in `machines`;
-processes sharing a machine never overlap; every process must finish by
-`production_deadline` (and by its own `latest_finish` if given).
+processes sharing a machine may overlap only within its declared capacity;
+every process must finish by `production_deadline` (and by its own
+`latest_finish` if given).
 
 ## 3. How to provide user input
 
 No Python code changes are needed. Provide a JSON file (see
 `examples/widget_lab.json`):
 
+`examples/widget_lab.json` is included in the source repository, not in the
+installed wheel. When using the installed package, provide your own JSON
+file or use the inline request example below.
+
 ```json
 {
-  "factory": { "factory_name": "...", "planning_horizon_hours": 12,
-               "production_deadline": 10, "processes": [...], "machines": [...] },
+  "factory": {
+    "factory_name": "Demo Widget Lab",
+    "planning_horizon_hours": 1,
+    "production_deadline": 1,
+    "processes": [{
+      "process_id": "step_x",
+      "process_name": "Step X",
+      "duration_hours": 0.5,
+      "power_kw": 1,
+      "dependencies": [],
+      "is_flexible": true
+    }],
+    "machines": []
+  },
   "energy": {
-    "solar_profile":  { "0": 0, "1": 0, "...": 0 },
-    "tariff_profile": { "0": 0.45, "1": 0.45, "...": 0.45 },
+    "solar_profile": { "0": 0 },
+    "tariff_profile": { "0": 0.45 },
     "grid_emission_factor": 0.35
   }
 }
@@ -106,6 +123,9 @@ No Python code changes are needed. Provide a JSON file (see
 - Omitting `energy` falls back to the DEMO solar/tariff profiles.
 - `grid_emission_factor` is optional (kg CO2 per kWh); omit it and carbon
   results are reported as **UNAVAILABLE** rather than invented.
+- Integrations parsing JSON before calling `optimize_request()` should reject
+  duplicate object properties; once parsed into a dict, duplicates cannot be
+  detected.
 
 ```python
 from optimizer.input_layer import load_user_input
@@ -125,13 +145,13 @@ The engine (Google OR-Tools CP-SAT, `TIME_SCALE = 2` → half-hour slots):
 
 - **Variables** — integer start/end per process; `end = start + duration`.
 - **Constraints** — planning horizon, production deadline, precedence
-  (`end[dep] ≤ start[proc]`), per-process time windows, machine NoOverlap
-  via interval variables, and non-flexible processes pinned to their
-  baseline start times.
+  (`end[dep] ≤ start[proc]`), per-process time windows, assigned-machine
+  capacity via interval/cumulative constraints, and non-flexible processes
+  pinned to their baseline start times.
 - **V1 baseline** — minimize makespan.
-- **V2 solar-aware** — maximize the exact in-model solar energy of flexible
-  processes (`min(solar_kW, power_kW) × 0.5 h` per slot, 0.1 kWh units),
-  makespan as tiebreaker.
+- **V2 solar-aware** — maximize the exact in-model solar energy under the
+  shared site-wide solar pool, allocated separately in each half-hour slot;
+  makespan is the tiebreaker.
 - **V3/V4 cost-optimized** — minimize total grid electricity cost built
   exactly from the chosen start times (grid kWh × hourly tariff), makespan
   only as a tiebreaker.
@@ -153,20 +173,22 @@ or process names (enforced by tests).
 | cost savings / % | baseline cost − optimized cost, and percentage |
 | shifted processes | flexible processes moved vs baseline (> 0.1 h) |
 | machine utilization | busy hours and % per machine |
-| status | OPTIMAL / FEASIBLE / INFEASIBLE / INVALID INPUT |
+| status | OPTIMAL / FEASIBLE / INFEASIBLE / UNKNOWN / INVALID INPUT / ERROR |
 
 ## 6. Energy calculations (per process, actual scheduled times)
 
 ```
 total energy per slot = power_kw × slot_duration
-solar per slot        = min(solar_availability, power_kw) × slot_duration
+site solar per slot   = solar_profile[hour] × slot_duration
+allocated solar       ≤ site solar per slot and each process's demand
 grid per slot         = total − solar            (≥ 0, solar ≥ 0)
 cost per slot         = grid × tariff[hour]      (solar never billed)
 ```
 
 Guarantees: `solar + grid = total`, no negative values, and the in-model
 objective uses exactly these definitions (verified by tests against an
-independent recomputation).
+independent recomputation). Concurrent processes share the slot's solar
+allocation; solar is not independently credited to every process.
 
 All schedule times are relative to planning time 0 and use half-hour ticks.
 Hourly solar/tariff profile keys refer to elapsed hours from that origin and
@@ -189,7 +211,9 @@ value is ever invented.
 
 ## 8. How to add an eighth factory
 
-1. Copy `examples/widget_lab.json`, edit names, processes, machines, hours.
+1. From a source checkout, copy `examples/widget_lab.json` and edit names,
+   processes, machines, and hours. Installed wheels do not include this
+   repository example; supply your own JSON file or construct a request dict.
 2. Run it: `run_workflow("my_factory.json")` — done. No optimizer changes.
 
 To register a demo factory in the CLI, add one dict entry to
@@ -201,7 +225,7 @@ To register a demo factory in the CLI, add one dict entry to
 from optimizer.app import run_workflow, display_results, serialize_results
 
 result = run_workflow("examples/widget_lab.json")
-print(result["status"])            # OPTIMAL / FEASIBLE / INFEASIBLE / INVALID INPUT
+print(result["status"])            # OPTIMAL / FEASIBLE / INFEASIBLE / UNKNOWN / INVALID INPUT / ERROR
 if result["status"] == "INVALID INPUT":
     from optimizer.input_layer import format_validation_error
     # human-readable report of every problem:
@@ -216,7 +240,9 @@ from optimizer.visualization import (render_gantt_comparison,
                                      render_energy_comparison)
 render_gantt_comparison(result["results"]["baseline_schedule"],
                         result["results"]["optimized_schedule"])
-render_energy_profile(config_energy_solar_profile,
+from optimizer.input_layer import load_user_input
+config = load_user_input("examples/widget_lab.json")
+render_energy_profile(config.energy["solar_profile"],
                       result["results"]["optimized_schedule"])
 render_energy_comparison(result["results"]["baseline_schedule"],
                          result["results"]["optimized_schedule"])
@@ -224,13 +250,25 @@ render_energy_comparison(result["results"]["baseline_schedule"],
 
 CLI (all registered demo factories): `python -m optimizer`.
 
+The `examples/widget_lab.json` paths in this source-checkout example are not
+available from an installed wheel. For installed-package use, supply a file
+you created or pass a request dict to the public API.
+
 ## 10. Known limitations
 
-- Non-preemptive scheduling; single-capacity machines (capacity is informational).
+- Non-preemptive scheduling; machine capacity is enforced, while machine
+  availability and machine power are informational.
 - No setup/changeover times; constant power while a process runs.
-- Solar availability is not a shared pool: concurrent processes may each use
-  the full hourly availability (harmless in the demo data, conservative in
-  general).
+- Solar availability is shared site-wide and allocated per half-hour slot;
+  solar is not stored or exported.
 - Half-hour grid; reified slot encoding scales O(horizon × processes).
 - DEMO/SIMULATED data only — do not interpret results as real industrial
   savings, prices, weather, or company performance.
+- `options.max_time_seconds` limits each solver stage, not the full request;
+  parsing, validation, and model construction are outside that limit. The
+  library does not impose a universal process-count or horizon cap because
+  safe limits depend on the deployment's resource budget. A service wrapper
+  accepting untrusted inputs must impose request-size and instance-size
+  limits at the boundary and an end-to-end deadline around the call. A
+  thread or coroutine timeout does not stop synchronous solver work; hard
+  cancellation requires a supervised, isolated worker process.

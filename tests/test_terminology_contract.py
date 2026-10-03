@@ -30,10 +30,11 @@ from optimizer.public_api import optimize
 
 SHARED_VOCABULARY = {
     # input: factory
-    "factory_name", "factory_type", "planning_horizon_hours",
+    "factory_id", "factory_name", "factory_type", "planning_horizon_hours",
     "production_deadline", "processes", "machines",
     # input: process
-    "process_id", "process_name", "duration_hours", "power_kw", "quantity",
+    "process_id", "work_order_id", "process_name", "duration_hours",
+    "power_kw", "quantity", "quantity_unit",
     "dependencies", "is_flexible", "machine_id", "capacity_units", "earliest_start",
     "latest_finish",
     # input: machine
@@ -44,6 +45,7 @@ SHARED_VOCABULARY = {
     "max_time_seconds", "factory", "energy", "options",
     # envelope
     "api_version", "status", "result", "errors", "warnings",
+    "error_category",
     # result payload
     "baseline", "optimized", "comparison", "machine_utilization", "carbon",
     "validation_errors", "solve_time_seconds",
@@ -53,6 +55,7 @@ SHARED_VOCABULARY = {
     "solar_utilization_percent", "shifted_processes",
     # schedule
     "makespan_hours", "processes", "energy",
+    "solver_diagnostics", "best_objective", "best_bound", "optimality_gap",
     # energy block
     "total_kwh", "solar_kwh", "grid_kwh",
     # process row
@@ -71,7 +74,7 @@ SHARED_VOCABULARY = {
 FORBIDDEN_TERMS = {
     "production_order", "production_order_id", "production_target",
     "machine_available", "energy_savings", "solar_available_kw",
-    "schedule_id", "optimization_status", "factory_id", "deadline",
+    "schedule_id", "optimization_status", "deadline",
     # legacy internal spellings
     "solar_energy_kwh", "total_solar_kwh", "total_grid_kwh",
     "total_energy_kwh",
@@ -238,6 +241,106 @@ class InternalTermsStayInternalTests(unittest.TestCase):
 class DocsSchemaConsistencyTests(unittest.TestCase):
     """schemas.py, API.md and code must teach identical field names."""
 
+    def test_api_response_example_is_valid_json(self):
+        with open("optimizer/API.md", encoding="utf-8") as handle:
+            doc = handle.read()
+        canonical_section = doc.split(
+            "## 5. Output format (canonical schema)", 1
+        )[1]
+        canonical_example = canonical_section.split("```json", 1)[1].split(
+            "```", 1
+        )[0]
+        canonical_response = json.loads(canonical_example)
+        canonical_result = canonical_response["result"]
+        comparison = canonical_result["comparison"]
+        self.assertAlmostEqual(
+            comparison["cost_savings"],
+            comparison["cost_baseline"] - comparison["cost_optimized"],
+        )
+        self.assertAlmostEqual(
+            comparison["solar_utilization_percent"],
+            canonical_result["optimized"]["energy"]["solar_kwh"]
+            / canonical_result["optimized"]["energy"]["total_kwh"] * 100,
+        )
+        carbon = canonical_result["carbon"]
+        self.assertAlmostEqual(
+            carbon["co2_reduction_kg"],
+            carbon["baseline_co2_kg"] - carbon["optimized_co2_kg"],
+        )
+        input_section = doc.split("## 4. Input format (canonical schema)", 1)[1]
+        input_example = input_section.split("```json", 1)[1].split(
+            "```", 1
+        )[0]
+        validate_user_input(json.loads(input_example))
+        section = doc.split(
+            "Response (values from the DEMO Widget Lab, DEMO/SIMULATED data):",
+            1,
+        )[1]
+        example = section.split("```json", 1)[1].split("```", 1)[0]
+        response = json.loads(example)
+        self.assertIn("warnings", response)
+        self.assertEqual(response["result"]["comparison"]["cost_savings"], 8.1)
+
+    def test_readme_visualization_example_uses_configured_solar_profile(self):
+        with open("optimizer/README.md", encoding="utf-8") as handle:
+            doc = handle.read()
+        self.assertIn(
+            'config = load_user_input("examples/widget_lab.json")', doc
+        )
+        self.assertIn(
+            'render_energy_profile(config.energy["solar_profile"]', doc
+        )
+
+    def test_readme_describes_machine_capacity_parallelism(self):
+        with open("optimizer/README.md", encoding="utf-8") as handle:
+            doc = handle.read()
+        self.assertIn(
+            "may overlap only within its declared capacity", doc
+        )
+        self.assertNotIn("processes sharing a machine never overlap", doc)
+        self.assertNotIn("machine NoOverlap", doc)
+
+        with open("optimizer/API.md", encoding="utf-8") as handle:
+            api_doc = handle.read()
+        self.assertNotIn("machine no-overlap", api_doc)
+        self.assertIn("machine-capacity constraints", api_doc)
+
+        with open("optimizer/factory_data.py", encoding="utf-8") as handle:
+            factory_doc = " ".join(handle.read().split())
+        self.assertIn(
+            "combined `capacity_units` do not exceed this value",
+            factory_doc,
+        )
+        self.assertIn(
+            "optional positive machine-capacity demand (default 1)",
+            factory_doc,
+        )
+        self.assertNotIn("processes sharing a machine never overlap", factory_doc)
+
+    def test_deployment_docs_explain_hard_cancellation_boundary(self):
+        for path in ("optimizer/API.md", "optimizer/README.md"):
+            with self.subTest(path=path):
+                with open(path, encoding="utf-8") as handle:
+                    doc = " ".join(handle.read().lower().split())
+                self.assertIn("does not stop", doc)
+                self.assertIn("isolated worker process", doc)
+
+    def test_docs_identify_repository_only_example_file(self):
+        for path in ("optimizer/API.md", "optimizer/README.md"):
+            with self.subTest(path=path):
+                with open(path, encoding="utf-8") as handle:
+                    doc = " ".join(handle.read().lower().split())
+                self.assertIn("not in the installed wheel", doc)
+
+    def test_all_fenced_json_documentation_examples_parse(self):
+        for path in ("optimizer/API.md", "optimizer/README.md"):
+            with self.subTest(path=path):
+                with open(path, encoding="utf-8") as handle:
+                    doc = handle.read()
+                for match in re.finditer(
+                        r"```json\s*\n(.*?)\n```", doc, re.DOTALL):
+                    json.loads(match.group(1))
+
     def test_docs_reference_input_terms(self):
         with open("optimizer/API.md", encoding="utf-8") as handle:
             doc = handle.read()
@@ -265,7 +368,8 @@ class DocsSchemaConsistencyTests(unittest.TestCase):
             doc = " ".join(handle.read().lower().split())
         for term in ("Time 0", "timezone", "daylight-saving",
                      "currency", "half-hour", "final hourly bucket",
-                     "shared, site-wide hourly pool", "[h, h + 1)"):
+                     "shared, site-wide pool", "half-hour scheduling slot",
+                     "[h, h + 1)"):
             self.assertIn(term.lower(), doc,
                           msg=f"API.md missing energy/time contract term: {term}")
 

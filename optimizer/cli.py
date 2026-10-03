@@ -32,7 +32,9 @@ def run_factory(factory_data):
     print()
 
     print("Generating solar + tariff optimized schedule...")
-    optimized_schedule = create_cost_optimized_schedule(config)
+    optimized_schedule = create_cost_optimized_schedule(
+        config, baseline_schedule=baseline_schedule
+    )
     print()
 
     print_baseline_schedule(baseline_schedule)

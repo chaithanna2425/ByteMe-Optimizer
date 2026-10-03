@@ -17,11 +17,17 @@ Optimization results use DEMO/SIMULATED factory and energy data only.
 import json
 import traceback
 
-from optimizer.input_layer import InputValidationError, load_user_input
+from optimizer.input_layer import (
+    InputValidationError,
+    _parse_json,
+    _read_json_file,
+    load_user_input,
+)
 from optimizer.models import FactoryConfigError, TIME_SCALE, time_to_grid_floor
 from optimizer.optimizer import (
     DEFAULT_PUBLIC_TIME_LIMIT_SECONDS,
     SolverInfeasibleError,
+    SolverModelInvalidError,
     SolverUnknownError,
     create_baseline_schedule,
     create_cost_optimized_schedule,
@@ -39,7 +45,7 @@ STATUS_UNKNOWN = "UNKNOWN"          # limit hit, no solution, infeasibility NOT 
 STATUS_INVALID_INPUT = "INVALID INPUT"
 STATUS_ERROR = "ERROR"
 
-_API_VERSION = "1.0"
+_API_VERSION = "2.0"
 
 
 class OptimizerInputError(Exception):
@@ -57,16 +63,22 @@ class OptimizerInputError(Exception):
 class OptimizerInternalError(Exception):
     """Canonical error for unexpected internal failures (bug reports)."""
 
+    def __init__(self, message, result=None):
+        self.result = result
+        super().__init__(message)
+
 
 class _PipelineUnknown(Exception):
     """Internal: SolverUnknownError raised inside the pipeline; carries the
     validated config's warnings and recorded solve time so entry points can
     surface them."""
 
-    def __init__(self, warnings, solve_time_seconds=None, baseline_schedule=None):
+    def __init__(self, warnings, solve_time_seconds=None, baseline_schedule=None,
+                 factory_name=None):
         self.warnings = list(warnings)
         self.solve_time_seconds = solve_time_seconds
         self.baseline_schedule = baseline_schedule
+        self.factory_name = factory_name
         super().__init__("solver limit hit without a proven result")
 
 
@@ -76,22 +88,32 @@ class _PipelineUnknown(Exception):
 # ---------------------------------------------------------------------------
 
 def _error_result(status, errors, warnings=None):
+    error_category = {
+        STATUS_INVALID_INPUT: "VALIDATION_ERROR",
+        STATUS_INFEASIBLE: "INFEASIBLE",
+        STATUS_ERROR: "INTERNAL_ERROR",
+    }.get(status)
     return {
         "api_version": _API_VERSION,
         "status": status,
         "result": None,
         "errors": list(errors),
         "warnings": list(warnings or []),
+        "error_category": error_category,
     }
 
 
 def _ok_result(result):
+    error_category = (
+        "INFEASIBLE" if result.get("status") == STATUS_INFEASIBLE else None
+    )
     return {
         "api_version": _API_VERSION,
         "status": result["status"],
         "result": result,
         "errors": None,
         "warnings": list(result.get("warnings", [])),
+        "error_category": error_category,
     }
 
 
@@ -125,6 +147,7 @@ def _project_schedule(schedule):
         "status": schedule["status"],
         "makespan_hours": schedule["makespan"],
         "solve_time_seconds": schedule.get("solve_time_seconds"),
+        "solver_diagnostics": schedule.get("solver_diagnostics"),
         "processes": _project_process_rows(schedule),
         "energy": {
             "total_kwh": schedule["total_energy_kwh"],
@@ -246,6 +269,7 @@ def _run_pipeline(source, objective, include_infeasible_time=False):
         raise _PipelineUnknown(
             getattr(config, "warnings", []),
             getattr(err, "solve_time_seconds", None),
+            factory_name=config.factory_name,
         )
     except SolverInfeasibleError as err:
         if include_infeasible_time:
@@ -284,7 +308,8 @@ def _run_pipeline(source, objective, include_infeasible_time=False):
                 "optimality could be proven)"
             )
         raise _PipelineUnknown(
-            unknown_warnings, tot_t, baseline
+            unknown_warnings, tot_t, baseline,
+            factory_name=config.factory_name,
         )
     except SolverInfeasibleError as err:
         if include_infeasible_time:
@@ -431,9 +456,8 @@ def _parse_source(source):
     if isinstance(source, str):
         text = source.strip()
         if text.startswith("{"):
-            return json.loads(text)
-        with open(text, "r", encoding="utf-8") as handle:
-            return json.load(handle)
+            return _parse_json(text)
+        return _read_json_file(text)
     raise OptimizerInputError([
         f"Unsupported input type {type(source).__name__}: provide a dict, "
         f"JSON string, or JSON file path"
@@ -450,7 +474,7 @@ def optimize(source, objective="cost", strict=False):
 
     Args:
         source: dict, JSON string, or JSON file path in the canonical input
-            schema ({"factory": {...}, "energy": {...}, "options": {...}}).
+            schema. File paths are for trusted/local callers only.
         objective: "cost" (default) or "solar".
         strict: if True, raises OptimizerInputError for invalid input and
             OptimizerInternalError for internal failures instead of
@@ -459,12 +483,13 @@ def optimize(source, objective="cost", strict=False):
     Returns:
         dict (always JSON-safe):
             {
-              "api_version": "1.0",
+              "api_version": "2.0",
               "status": "OPTIMAL" | "FEASIBLE" | "INFEASIBLE"
-                        | "INVALID INPUT" | "ERROR",
+                        | "UNKNOWN" | "INVALID INPUT" | "ERROR",
               "result": {...} | None,
               "errors": [str, ...] | None,
-              "warnings": [str, ...]   # non-fatal notices (may be empty)
+              "warnings": [str, ...],
+              "error_category": str | None
             }
 
     Never raises for invalid input or infeasible problems in default mode;
@@ -490,13 +515,20 @@ def optimize(source, objective="cost", strict=False):
     except _PipelineUnknown as exc:
         # UNKNOWN: limit hit without a solution; infeasibility NOT proven.
         # Never reported as INFEASIBLE.
-        if strict:
-            raise OptimizerInternalError(str(exc)) from exc
-        return _unknown_result(
-            _factory_name(source), objective, exc.warnings,
+        result = _unknown_result(
+            exc.factory_name or _factory_name(source), objective, exc.warnings,
             getattr(exc, "solve_time_seconds", None),
             getattr(exc, "baseline_schedule", None),
         )
+        return result
+
+    except SolverModelInvalidError as exc:
+        if strict:
+            raise OptimizerInternalError(str(exc)) from exc
+        return _error_result(STATUS_ERROR, [
+            "Internal optimizer error. Please report this issue "
+            "(error class: SolverModelInvalidError)."
+        ])
 
     except OptimizerInputError:
         if strict:
@@ -526,6 +558,23 @@ def optimize(source, objective="cost", strict=False):
             "Internal optimizer error. Please report this issue "
             f"(error class: {type(exc).__name__})."
         ])
+
+
+def optimize_request(request_data, objective="cost", strict=False):
+    """Optimize a parsed request object without filesystem path handling.
+
+    Service handlers should pass the already-parsed JSON object here. The
+    local ``optimize`` convenience API remains able to read trusted files.
+    """
+    if not isinstance(request_data, dict):
+        problems = [
+            "Service requests must be parsed JSON objects; filesystem paths "
+            "and JSON text are not accepted",
+        ]
+        if strict:
+            raise OptimizerInputError(problems)
+        return _error_result(STATUS_INVALID_INPUT, problems)
+    return optimize(request_data, objective=objective, strict=strict)
 
 
 def get_input_schema():

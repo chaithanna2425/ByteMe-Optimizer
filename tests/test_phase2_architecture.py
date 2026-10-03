@@ -293,9 +293,10 @@ class ContractStillValidTests(unittest.TestCase):
         result = optimize(copy.deepcopy(VALID_INPUT))
         self.assertEqual(
             set(result.keys()),
-            {"api_version", "status", "result", "errors", "warnings"},
+            {"api_version", "status", "result", "errors", "warnings",
+             "error_category"},
         )
-        self.assertEqual(result["api_version"], "1.0")
+        self.assertEqual(result["api_version"], "2.0")
 
     def test_payload_fields_unchanged(self):
         payload = optimize(copy.deepcopy(VALID_INPUT))["result"]

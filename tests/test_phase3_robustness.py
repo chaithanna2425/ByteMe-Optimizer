@@ -199,30 +199,30 @@ class PropertyInvariantTests(unittest.TestCase):
 
         rows = _by_id(schedule)
 
-        # Shared solar pool (Phase 4.3): recompute each row's solar and
-        # cost against the SAME hourly pool - concurrent processes
-        # collectively draw at most the hourly solar, split greedily in
-        # process_id order (the documented reporting rule).
+        # Recompute each row's solar and cost against the shared half-hour
+        # slot pool, split greedily in process_id order.
         running = {}
         for row in sorted(schedule["processes"],
                           key=lambda r: r["process_id"]):
             t = row["start_time"]
             while t < row["end_time"]:
-                h = int(t)
-                dur = min(h + 1, row["end_time"]) - t
-                running.setdefault(h, []).append(
+                slot = int(t * 2)
+                dur = min((slot + 1) / 2, row["end_time"]) - t
+                running.setdefault(slot, []).append(
                     (row["process_id"], row["power_kw"] * dur, dur))
                 t += dur
         pool_solar = {p["process_id"]: 0.0 for p in schedule["processes"]}
         pool_cost = {p["process_id"]: 0.0 for p in schedule["processes"]}
-        for h, runners in running.items():
-            supply = solar.get(h, 0) * 1.0
+        for slot, runners in running.items():
+            hour = (slot // 2) % 24
+            solar_kw = solar.get(hour, 0)
+            supply = solar_kw / 2
             for pid, energy, dur in runners:
-                draw_cap = solar.get(h, 0) * dur
+                draw_cap = solar_kw * dur
                 s = min(energy, draw_cap, max(supply, 0.0))
                 supply -= s
                 pool_solar[pid] += s
-                pool_cost[pid] += (energy - s) * tariff.get(h, 0)
+                pool_cost[pid] += (energy - s) * tariff.get(hour, 0)
 
         for pid, spec in specs.items():
             row = rows[pid]
@@ -248,7 +248,7 @@ class PropertyInvariantTests(unittest.TestCase):
                 row["solar_kwh"] + row["grid_kwh"], total, places=6, msg=pid)
             self.assertGreaterEqual(row["solar_kwh"], 0, msg=pid)
             self.assertGreaterEqual(row["grid_kwh"], 0, msg=pid)
-            # solar = the process's share of the shared hourly pool
+            # solar = the process's share of the shared slot pool
             # (never over-allocated; recomputed independently)
             self.assertAlmostEqual(row["solar_kwh"], pool_solar[pid],
                                    places=6, msg=pid)

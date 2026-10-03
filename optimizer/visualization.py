@@ -12,6 +12,8 @@ DEMO/SIMULATED.
 - render_energy_comparison: energy/cost bars, baseline vs optimized
 """
 
+from optimizer.models import TIME_SCALE
+
 BAR_WIDTH = 48  # character columns spanning the planning horizon
 
 
@@ -71,40 +73,30 @@ def render_energy_profile(solar_profile, schedule, title="ENERGY PROFILE"):
     """
     Render the solar availability profile and per-hour grid usage of a
     schedule. Grid usage follows the SAME shared-solar-pool allocation as
-    reporting (hourly pool never exceeded, per-process draw cap while
+    reporting (shared slot pool never exceeded, per-process draw cap while
     running) so the chart always matches the reported numbers.
     """
-    from optimizer.optimizer import allocate_solar_greedy
+    from optimizer.optimizer import _allocate_solar_by_slot
 
     horizon = int(max(p["end_time"] for p in schedule["processes"]))
 
     # Shared-pool allocation: per-process solar/grid exactly as reported
-    alloc = allocate_solar_greedy(
+    _, grid_by_slot = _allocate_solar_by_slot(
         [{"process_id": p["process_id"], "start_time": p["start_time"],
           "end_time": p["end_time"], "power_kw": p["power_kw"]}
          for p in schedule["processes"]],
         solar_profile,
+        include_grid_by_slot=True,
     )
 
-    # Per-hour grid usage across processes (solar credited only while and
-    # where each process actually runs, per the shared-pool rule)
+    # Aggregate the exact half-hour grid allocation into displayed hours.
     grid_by_hour = {h: 0.0 for h in range(horizon + 1)}
-    for p in schedule["processes"]:
-        remaining_solar = alloc[p["process_id"]]["solar_kwh"]
-        window = p["power_kw"] * (p["end_time"] - p["start_time"])
-        t = p["start_time"]
-        while t < p["end_time"]:
-            hour = int(t)
-            overlap = min(hour + 1, p["end_time"]) - t
-            energy = p["power_kw"] * overlap
-            # pro-rata attribution of this process's pooled solar
-            solar_in_slot = remaining_solar * (energy / window) if window else 0.0
-            remaining_solar -= solar_in_slot
-            grid_by_hour[hour] += max(energy - solar_in_slot, 0.0)
-            t += overlap
+    for slot, grid_kwh in grid_by_slot.items():
+        grid_by_hour[slot // TIME_SCALE] += grid_kwh
 
-    scale = max(max(grid_by_hour.values()), max(solar_profile.get(h, 0)
-                                                for h in range(horizon + 1)), 1.0)
+    scale = max(max(grid_by_hour.values()), max(
+        solar_profile.get(h % 24, 0) for h in range(horizon + 1)
+    ), 1.0)
 
     print("=" * 100)
     print(f"{title} - {schedule.get('factory_name', 'Factory')}")
@@ -112,7 +104,7 @@ def render_energy_profile(solar_profile, schedule, title="ENERGY PROFILE"):
     print(f"{'Hour':<6} {'Solar kW':>9}  {'Solar':<34} {'Grid kWh':>9}  {'Grid':<34}")
     print("-" * 100)
     for hour in range(horizon + 1):
-        solar_kw = solar_profile.get(hour, 0)
+        solar_kw = solar_profile.get(hour % 24, 0)
         grid = grid_by_hour[hour]
         solar_bar = "#" * int(round(solar_kw / scale * 32))
         grid_bar = "#" * int(round(grid / scale * 32))

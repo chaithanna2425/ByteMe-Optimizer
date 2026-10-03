@@ -133,6 +133,11 @@ def run_optimization(config, objective="cost"):
     Uses the energy profiles attached to the config (caller-supplied when
     provided, DEMO/SIMULATED profiles otherwise).
     """
+    if objective not in ("cost", "solar"):
+        raise InputValidationError([
+            "objective must be 'cost' or 'solar', "
+            f"got {objective!r}"
+        ])
     solar_profile, tariff_profile = _config_profiles(config)
     if objective == "solar":
         return _run_scheduler(
