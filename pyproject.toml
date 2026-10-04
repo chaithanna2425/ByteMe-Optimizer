@@ -13,5 +13,8 @@ dependencies = ["ortools==9.15.6755"]
 [project.optional-dependencies]
 test = ["pytest>=8", "jsonschema>=4"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.setuptools.packages.find]
 include = ["optimizer"]

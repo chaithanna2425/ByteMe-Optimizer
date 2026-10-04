@@ -530,11 +530,10 @@ def optimize(source, objective="cost", strict=False):
             "(error class: SolverModelInvalidError)."
         ])
 
-    except OptimizerInputError:
+    except OptimizerInputError as exc:
         if strict:
             raise
-        exc = OptimizerInputError(["unsupported input source"])
-        return _error_result(STATUS_INVALID_INPUT, exc.problems)
+        return _error_result(STATUS_INVALID_INPUT, exc.problems, [])
 
     except FactoryConfigError as exc:
         if strict:

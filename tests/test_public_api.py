@@ -831,6 +831,10 @@ class OptimizeInvalidInputTests(unittest.TestCase):
         result = optimize(12345)
         self.assertEqual(result["status"], STATUS_INVALID_INPUT)
         self.assertEqual(result["error_category"], "VALIDATION_ERROR")
+        self.assertTrue(any(
+            "Unsupported input type int" in error
+            for error in result["errors"]
+        ))
 
     def test_service_api_accepts_only_parsed_objects(self):
         for source in ("{}", "definitely_missing_service_path.json", None):
