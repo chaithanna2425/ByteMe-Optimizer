@@ -24,6 +24,11 @@ grid emission factor), it:
 4. Returns a structured comparison: schedules, makespans, energy split
    (solar/grid/total), costs, savings, shifted processes, machine
    utilization, and optional carbon (CO2) metrics.
+5. Independently checks solved schedules against the validated request and
+   recomputes energy, solar/grid allocation, cost, comparison, and carbon
+   metrics before returning a successful result. An internal verification
+   failure returns `ERROR` (or raises `OptimizerInternalError` in strict
+   mode); it never exposes the unverified schedule.
 
 ## 2. What the optimizer does NOT do
 
@@ -59,6 +64,15 @@ result = optimize(input_source, objective="cost", strict=False)
   Parse request JSON with duplicate-property rejection before producing the
   object; duplicate keys are ambiguous and cannot be detected once collapsed
   into a Python dict.
+  - Deployments may pass an `OptimizerResourceLimits` instance (available from
+    `optimizer.public_api`) to `optimize_request` to reject oversized process
+    counts/planning horizons and cap the default per-stage solver budget. All limits default to `None`
+    intentionally: production thresholds require workload and SLA decisions.
+    A caller-supplied solver budget above the configured cap is rejected.
+    Apply request-byte limits before parsing JSON; the optimizer receives an
+    already-materialized object and cannot protect the parser's memory use.
+    Concurrency, total wall-clock deadlines, hard cancellation, and native
+    solver memory isolation belong in a supervised service/worker boundary.
 - `objective`: `"cost"` (default) or `"solar"`. May also be set per-request
   via `input["options"]["objective"]`.
 - `strict=False` (default): never raises for caller errors — always returns
@@ -66,6 +80,13 @@ result = optimize(input_source, objective="cost", strict=False)
   (caller problems) or `OptimizerInternalError` (bugs) instead.
 - Machine-readable contracts: `get_input_schema()`, `get_output_schema()`
   (Draft-07 JSON Schema dicts).
+- Completion and internal-failure events use the standard
+  `optimizer.public_api` logger. They carry a correlation ID, request hash,
+  aggregate model size, objective/status/scope, per-stage status/bounds/gaps/
+  timings, and package/OR-Tools versions; raw factory and process data are not
+  logged. A service may supply `correlation_id` to `optimize_request`; otherwise
+  a random identifier is generated. Configure a structured log handler and
+  appropriate retention/access controls in the hosting service.
 
 Import nothing else: `optimizer.public_api` is the only supported surface
 for external callers. Everything behind it (CP-SAT engine, model classes,
@@ -199,6 +220,7 @@ model semantics, not a requirement to supply real external data today.
     "status": "OPTIMAL",
     "factory_name": "Demo Widget Lab",
     "objective": "cost",
+    "optimization_scope": "FULL_DECLARED_CONSTRAINTS",
     "solve_time_seconds": 0.042,
     "baseline": {
       "status": "OPTIMAL",
@@ -312,12 +334,27 @@ Machine utilization reports `busy_hours` (sum of process durations),
 capacity-normalized `utilization_percent`. Capacity-1 metrics retain their
 previous interpretation.
 
-Status values: `OPTIMAL` (proven best), `FEASIBLE` (valid, not proven
-best — a warning explains why), `INFEASIBLE` (constraints cannot all
+Status values: `OPTIMAL` (the optimized-stage objective is proven best
+within `optimization_scope`), `FEASIBLE` (valid, not proven best — a warning explains why), `INFEASIBLE` (constraints cannot all
 hold), `UNKNOWN` (solver hit its time limit without finding a solution
 AND without proving infeasibility — never report as INFEASIBLE; retry
 with a larger `options.max_time_seconds`), `INVALID INPUT` (see
 `errors`), `ERROR` (internal failure; generic message, no stack trace).
+Deployment acceptance decision: a `FEASIBLE` schedule requires human approval
+before operational use. The library reports solver status but does not
+implement an approval workflow or authorize production release; the hosting
+service must enforce this decision.
+
+`optimization_scope` is `FULL_DECLARED_CONSTRAINTS` when all processes are
+flexible, so the optimized stage searches the full declared scheduling
+space. It is `CONDITIONAL_ON_BASELINE_PINNED_STARTS` when any process is
+non-flexible; those processes stay at the baseline's start times, and
+`OPTIMAL` then proves only the best objective for that restricted search
+space. This scope remains conditional even if the baseline itself is
+`OPTIMAL`, because another equally good baseline placement is not searched.
+The field describes the optimization model's scope; `status` and each
+schedule's `solver_diagnostics.status` report whether CP-SAT proved an
+optimum or only found a feasible solution.
 
 If baseline solving succeeds but optimization returns `UNKNOWN`, the result
 retains the baseline schedule and baseline machine utilization;

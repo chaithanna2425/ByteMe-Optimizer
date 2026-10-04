@@ -7,7 +7,6 @@ capacity>=2 -> up to `capacity` processes may run simultaneously
 capacity<=0 / non-integer -> rejected with clear INVALID INPUT
 """
 
-import copy
 import unittest
 
 from optimizer.public_api import (

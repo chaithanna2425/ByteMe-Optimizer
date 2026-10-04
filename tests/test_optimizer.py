@@ -306,7 +306,6 @@ class GenericEngineTests(unittest.TestCase):
 
     def test_engine_has_no_factory_specific_conditionals(self):
         import inspect
-        import re
         source = inspect.getsource(opt)
         self.assertNotRegex(
             source, r"if\s+factory\s*==", msg="factory equality check found"

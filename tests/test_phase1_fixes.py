@@ -11,12 +11,10 @@ Regression coverage for the integration-readiness fixes:
 
 import copy
 import json
-import math
 import unittest
 
 from optimizer import public_api
 from optimizer.public_api import (
-    STATUS_INFEASIBLE,
     STATUS_INVALID_INPUT,
     STATUS_OPTIMAL,
     optimize,

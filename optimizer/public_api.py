@@ -14,8 +14,13 @@ contract.
 Optimization results use DEMO/SIMULATED factory and energy data only.
 """
 
+import hashlib
+import importlib.metadata
 import json
-import traceback
+import logging
+import math
+import time
+import uuid
 
 from optimizer.input_layer import (
     InputValidationError,
@@ -23,7 +28,7 @@ from optimizer.input_layer import (
     _read_json_file,
     load_user_input,
 )
-from optimizer.models import FactoryConfigError, TIME_SCALE, time_to_grid_floor
+from optimizer.models import TIME_SCALE, FactoryConfigError, time_to_grid_floor
 from optimizer.optimizer import (
     DEFAULT_PUBLIC_TIME_LIMIT_SECONDS,
     SolverInfeasibleError,
@@ -32,6 +37,13 @@ from optimizer.optimizer import (
     create_baseline_schedule,
     create_cost_optimized_schedule,
     get_tariff,
+)
+from optimizer.resource_limits import OptimizerResourceLimits
+from optimizer.verification import (
+    ScheduleVerificationError,
+    verify_public_result,
+    verify_result_metrics,
+    verify_schedule,
 )
 
 # ---------------------------------------------------------------------------
@@ -45,7 +57,13 @@ STATUS_UNKNOWN = "UNKNOWN"          # limit hit, no solution, infeasibility NOT 
 STATUS_INVALID_INPUT = "INVALID INPUT"
 STATUS_ERROR = "ERROR"
 
+OPTIMIZATION_SCOPE_FULL = "FULL_DECLARED_CONSTRAINTS"
+OPTIMIZATION_SCOPE_BASELINE_PINNED = (
+    "CONDITIONAL_ON_BASELINE_PINNED_STARTS"
+)
+
 _API_VERSION = "2.0"
+_LOGGER = logging.getLogger(__name__)
 
 
 class OptimizerInputError(Exception):
@@ -74,11 +92,12 @@ class _PipelineUnknown(Exception):
     surface them."""
 
     def __init__(self, warnings, solve_time_seconds=None, baseline_schedule=None,
-                 factory_name=None):
+                 factory_name=None, optimization_scope=None):
         self.warnings = list(warnings)
         self.solve_time_seconds = solve_time_seconds
         self.baseline_schedule = baseline_schedule
         self.factory_name = factory_name
+        self.optimization_scope = optimization_scope
         super().__init__("solver limit hit without a proven result")
 
 
@@ -101,6 +120,102 @@ def _error_result(status, errors, warnings=None):
         "warnings": list(warnings or []),
         "error_category": error_category,
     }
+
+
+def _correlation_id(value):
+    if value is None:
+        return uuid.uuid4().hex
+    if (not isinstance(value, str) or not value or len(value) > 128
+            or any(not character.isprintable() for character in value)):
+        raise ValueError(
+            "correlation_id must be a non-empty printable string of at most "
+            "128 characters"
+        )
+    return value
+
+
+def _request_fingerprint(data):
+    try:
+        encoder = json.JSONEncoder(
+            sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        )
+        digest = hashlib.sha256()
+        for chunk in encoder.iterencode(data):
+            digest.update(chunk.encode("utf-8"))
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return None
+    return digest.hexdigest()
+
+
+def _solver_stage_metadata(result):
+    stages = {}
+    for name in ("baseline", "optimized"):
+        schedule = result.get(name)
+        if not isinstance(schedule, dict):
+            stages[name] = None
+            continue
+        diagnostics = schedule.get("solver_diagnostics") or {}
+        stages[name] = {
+            "status": schedule.get("status"),
+            "solve_time_seconds": schedule.get("solve_time_seconds"),
+            "best_objective": diagnostics.get("best_objective"),
+            "best_bound": diagnostics.get("best_bound"),
+            "optimality_gap": diagnostics.get("optimality_gap"),
+        }
+    return stages
+
+
+def _log_completed_request(
+    result, data, objective, correlation_id, elapsed_seconds
+):
+    factory = data.get("factory") if isinstance(data, dict) else None
+    processes = factory.get("processes") if isinstance(factory, dict) else None
+    machines = factory.get("machines", []) if isinstance(factory, dict) else []
+    try:
+        package_version = importlib.metadata.version("ByteMe-Optimizer")
+    except importlib.metadata.PackageNotFoundError:
+        package_version = None
+    try:
+        import ortools
+        ortools_version = ortools.__version__
+    except (AttributeError, ImportError):
+        ortools_version = None
+    payload = result.get("result") or {}
+    _LOGGER.info(
+        "Optimizer request completed",
+        extra={
+            "correlation_id": correlation_id,
+            "request_sha256": _request_fingerprint(data),
+            "optimizer_status": result.get("status"),
+            "objective": objective,
+            "optimization_scope": payload.get("optimization_scope"),
+            "process_count": len(processes) if isinstance(processes, list) else None,
+            "machine_count": len(machines) if isinstance(machines, list) else None,
+            "planning_horizon_hours": (
+                factory.get("planning_horizon_hours")
+                if isinstance(factory, dict) else None
+            ),
+            "solver_stages": _solver_stage_metadata(payload),
+            "total_solve_time_seconds": payload.get("solve_time_seconds"),
+            "elapsed_seconds": round(elapsed_seconds, 6),
+            "api_version": _API_VERSION,
+            "package_version": package_version,
+            "ortools_version": ortools_version,
+        },
+    )
+
+
+def _log_rejected_request(correlation_id, failure_class, problem_count):
+    _LOGGER.info(
+        "Optimizer request rejected",
+        extra={
+            "correlation_id": correlation_id,
+            "optimizer_status": STATUS_INVALID_INPUT,
+            "failure_class": failure_class,
+            "problem_count": problem_count,
+        },
+    )
 
 
 def _ok_result(result):
@@ -157,6 +272,13 @@ def _project_schedule(schedule):
     }
 
 
+def _optimization_scope(config):
+    """Describe whether optimization can move every process from baseline."""
+    if any(not process.is_flexible for process in config.processes):
+        return OPTIMIZATION_SCOPE_BASELINE_PINNED
+    return OPTIMIZATION_SCOPE_FULL
+
+
 def _resolve_time_limit(data):
     """
     Resolve the solver time limit (seconds per solve).
@@ -170,10 +292,12 @@ def _resolve_time_limit(data):
     if raw is None:
         return DEFAULT_PUBLIC_TIME_LIMIT_SECONDS
     if (not isinstance(raw, (int, float)) or isinstance(raw, bool)
-            or raw <= 0 or raw != raw or raw in (float("inf"),)):
+            or raw <= 0 or not _is_finite_number(raw)):
         raise InputValidationError([
-            f"options.max_time_seconds must be a positive finite number of "
-            f"seconds, got {raw!r}"
+            (
+                f"options.max_time_seconds must be a positive finite number "
+                f"of seconds, got {raw!r}"
+            )
         ])
     return float(raw)
 
@@ -210,8 +334,10 @@ def _run_pipeline(source, objective, include_infeasible_time=False):
         source = _parse_source(source)
     if objective not in ("cost", "solar"):
         raise InputValidationError([
-            "objective must be 'cost' or 'solar', "
-            f"got {objective!r}"
+            (
+                "objective must be 'cost' or 'solar', "
+                f"got {objective!r}"
+            )
         ])
     config = load_user_input(source)
 
@@ -270,6 +396,7 @@ def _run_pipeline(source, objective, include_infeasible_time=False):
             getattr(config, "warnings", []),
             getattr(err, "solve_time_seconds", None),
             factory_name=config.factory_name,
+            optimization_scope=_optimization_scope(config),
         )
     except SolverInfeasibleError as err:
         if include_infeasible_time:
@@ -279,6 +406,7 @@ def _run_pipeline(source, objective, include_infeasible_time=False):
         if include_infeasible_time:
             return config, None, None, None
         return config, None, None
+    verify_schedule(config, baseline)
 
     # 3) Optimization stage reuses the baseline for pinning (no re-solve)
     try:
@@ -310,18 +438,20 @@ def _run_pipeline(source, objective, include_infeasible_time=False):
         raise _PipelineUnknown(
             unknown_warnings, tot_t, baseline,
             factory_name=config.factory_name,
+            optimization_scope=_optimization_scope(config),
         )
     except SolverInfeasibleError as err:
         if include_infeasible_time:
             return config, baseline, None, err.solve_time_seconds
         return config, baseline, None
+    verify_schedule(config, optimized, baseline=baseline)
     if include_infeasible_time:
         return config, baseline, optimized, None
     return config, baseline, optimized
 
 
 def _unknown_result(factory_name, objective, warnings, solve_time_seconds=None,
-                    baseline_schedule=None):
+                    baseline_schedule=None, optimization_scope=None):
     """UNKNOWN status: solver limit hit, infeasibility NOT proven."""
     if baseline_schedule is None:
         solver_warning = (
@@ -346,6 +476,7 @@ def _unknown_result(factory_name, objective, warnings, solve_time_seconds=None,
         "status": STATUS_UNKNOWN,
         "factory_name": factory_name,
         "objective": objective,
+        "optimization_scope": optimization_scope,
         "solve_time_seconds": solve_time_seconds,
         "baseline": baseline,
         "optimized": None,
@@ -362,6 +493,7 @@ def _optimize_internal(data, objective):
     config, baseline, optimized, infeasible_solve_time = _run_pipeline(
         data, objective, include_infeasible_time=True
     )
+    optimization_scope = _optimization_scope(config)
 
     if baseline is not None and baseline["status"] != STATUS_OPTIMAL:
         # Baseline found but not proven optimal (time limit); surface it.
@@ -389,6 +521,7 @@ def _optimize_internal(data, objective):
             "status": STATUS_INFEASIBLE,
             "factory_name": _factory_name(data),
             "objective": objective,
+            "optimization_scope": optimization_scope,
             "solve_time_seconds": total_solve_time,
             "baseline": _project_schedule(baseline) if baseline else None,
             "optimized": None,
@@ -402,11 +535,13 @@ def _optimize_internal(data, objective):
     # 4) Structured public result (delegates metrics to the application layer)
     from optimizer.app import build_results
     results = build_results(config, baseline, optimized)
+    verify_result_metrics(config, baseline, optimized, results)
 
     public = {
         "status": optimized["status"],
         "factory_name": results["factory_name"],
         "objective": objective,
+        "optimization_scope": optimization_scope,
         "solve_time_seconds": total_solve_time,
         "baseline": _project_schedule(baseline),
         "optimized": _project_schedule(optimized),
@@ -427,6 +562,7 @@ def _optimize_internal(data, objective):
         "validation_errors": None,
         "warnings": list(getattr(config, "warnings", [])),
     }
+    verify_public_result(baseline, optimized, results, public)
     return _ok_result(public)
 
 
@@ -441,12 +577,18 @@ def _run_solar(config, solar_profile, tariff_profile, baseline_schedule=None,
 
 
 def _factory_name(data):
-    try:
-        factory = data.get("factory", {}) if isinstance(data, dict) else {}
-        name = factory.get("factory_name")
-        return name if isinstance(name, str) and name else "unknown"
-    except Exception:
+    factory = data.get("factory", {}) if isinstance(data, dict) else {}
+    if not isinstance(factory, dict):
         return "unknown"
+    name = factory.get("factory_name")
+    return name if isinstance(name, str) and name else "unknown"
+
+
+def _is_finite_number(value):
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
 
 
 def _parse_source(source):
@@ -459,8 +601,10 @@ def _parse_source(source):
             return _parse_json(text)
         return _read_json_file(text)
     raise OptimizerInputError([
-        f"Unsupported input type {type(source).__name__}: provide a dict, "
-        f"JSON string, or JSON file path"
+        (
+            f"Unsupported input type {type(source).__name__}: provide a dict, "
+            "JSON string, or JSON file path"
+        )
     ])
 
 
@@ -468,7 +612,7 @@ def _parse_source(source):
 # PUBLIC API
 # ---------------------------------------------------------------------------
 
-def optimize(source, objective="cost", strict=False):
+def optimize(source, objective="cost", strict=False, correlation_id=None):
     """
     Public optimizer entry point.
 
@@ -496,6 +640,9 @@ def optimize(source, objective="cost", strict=False):
     internal/unexpected failures return STATUS_ERROR with a generic message
     (no stack traces are exposed as normal results).
     """
+    correlation_id = _correlation_id(correlation_id)
+    started = time.perf_counter()
+    data = None
     try:
         data = _parse_source(source)
 
@@ -504,9 +651,17 @@ def optimize(source, objective="cost", strict=False):
         if isinstance(options, dict):
             objective = options.get("objective", objective)
 
-        return _optimize_internal(data, objective)
+        result = _optimize_internal(data, objective)
+        _log_completed_request(
+            result, data, objective, correlation_id,
+            time.perf_counter() - started,
+        )
+        return result
 
     except InputValidationError as exc:
+        _log_rejected_request(
+            correlation_id, type(exc).__name__, len(exc.problems)
+        )
         if strict:
             raise OptimizerInputError(exc.problems) from exc
         return _error_result(STATUS_INVALID_INPUT, exc.problems,
@@ -519,23 +674,43 @@ def optimize(source, objective="cost", strict=False):
             exc.factory_name or _factory_name(source), objective, exc.warnings,
             getattr(exc, "solve_time_seconds", None),
             getattr(exc, "baseline_schedule", None),
+            getattr(exc, "optimization_scope", None),
         )
+        if isinstance(data, dict):
+            _log_completed_request(
+                result, data, objective, correlation_id,
+                time.perf_counter() - started,
+            )
         return result
 
     except SolverModelInvalidError as exc:
+        _LOGGER.error(
+            "CP-SAT rejected an optimizer model",
+            extra={
+                "correlation_id": correlation_id,
+                "optimizer_status": STATUS_ERROR,
+                "failure_class": type(exc).__name__,
+            },
+        )
         if strict:
             raise OptimizerInternalError(str(exc)) from exc
         return _error_result(STATUS_ERROR, [
-            "Internal optimizer error. Please report this issue "
-            "(error class: SolverModelInvalidError)."
+            (
+                "Internal optimizer error. Please report this issue "
+                "(error class: SolverModelInvalidError)."
+            )
         ])
 
     except OptimizerInputError as exc:
+        _log_rejected_request(
+            correlation_id, type(exc).__name__, len(exc.problems)
+        )
         if strict:
             raise
         return _error_result(STATUS_INVALID_INPUT, exc.problems, [])
 
     except FactoryConfigError as exc:
+        _log_rejected_request(correlation_id, type(exc).__name__, 1)
         if strict:
             raise OptimizerInputError([str(exc)]) from exc
         return _error_result(STATUS_INVALID_INPUT, [str(exc)])
@@ -543,37 +718,144 @@ def optimize(source, objective="cost", strict=False):
     except (OSError, json.JSONDecodeError) as exc:
         # unreadable file / malformed JSON
         message = f"Could not read input: {exc}"
+        _log_rejected_request(correlation_id, type(exc).__name__, 1)
         if strict:
             raise OptimizerInputError([message]) from exc
         return _error_result(STATUS_INVALID_INPUT, [message])
 
+    except ScheduleVerificationError as exc:
+        _LOGGER.error(
+            "Optimizer output failed independent verification",
+            extra={
+                "correlation_id": correlation_id,
+                "optimizer_status": STATUS_ERROR,
+                "failure_class": type(exc).__name__,
+            },
+        )
+        if strict:
+            raise OptimizerInternalError(
+                "Optimizer output failed independent verification"
+            ) from exc
+        return _error_result(STATUS_ERROR, [
+            (
+                "Internal optimizer error. Please report this issue "
+                "(error class: ScheduleVerificationError)."
+            )
+        ])
+
     except Exception as exc:  # unexpected internal failure
+        _LOGGER.error(
+            "Unexpected optimizer failure",
+            extra={
+                "correlation_id": correlation_id,
+                "optimizer_status": STATUS_ERROR,
+                "failure_class": type(exc).__name__,
+            },
+        )
         if strict:
             raise OptimizerInternalError(str(exc)) from exc
         # Generic message only - no stack traces in user-facing results.
-        # (Full traceback is printed to the server log for debugging.)
-        traceback.print_exc()
         return _error_result(STATUS_ERROR, [
-            "Internal optimizer error. Please report this issue "
-            f"(error class: {type(exc).__name__})."
+            (
+                "Internal optimizer error. Please report this issue "
+                f"(error class: {type(exc).__name__})."
+            )
         ])
 
 
-def optimize_request(request_data, objective="cost", strict=False):
+def optimize_request(
+    request_data,
+    objective="cost",
+    strict=False,
+    limits: OptimizerResourceLimits | None = None,
+    correlation_id=None,
+):
     """Optimize a parsed request object without filesystem path handling.
 
     Service handlers should pass the already-parsed JSON object here. The
     local ``optimize`` convenience API remains able to read trusted files.
+    Optional ``limits`` let deployments bound process count, planning
+    horizon, and per-stage solver time without imposing guessed defaults.
     """
+    correlation_id = _correlation_id(correlation_id)
     if not isinstance(request_data, dict):
-        problems = [
+        problems = [(
             "Service requests must be parsed JSON objects; filesystem paths "
-            "and JSON text are not accepted",
-        ]
+            "and JSON text are not accepted"
+        )]
+        _log_rejected_request(
+            correlation_id, "NonObjectServiceRequest", len(problems)
+        )
         if strict:
             raise OptimizerInputError(problems)
         return _error_result(STATUS_INVALID_INPUT, problems)
-    return optimize(request_data, objective=objective, strict=strict)
+    if limits is not None and not isinstance(limits, OptimizerResourceLimits):
+        raise TypeError("limits must be an OptimizerResourceLimits instance")
+
+    limited_request = request_data
+    problems = []
+    factory = request_data.get("factory")
+    if isinstance(factory, dict):
+        processes = factory.get("processes")
+        if (limits is not None and limits.max_processes is not None
+                and isinstance(processes, list)
+                and len(processes) > limits.max_processes):
+            problems.append(
+                "request exceeds configured max_processes "
+                f"({limits.max_processes})"
+            )
+        horizon = factory.get("planning_horizon_hours")
+        if (limits is not None
+                and limits.max_planning_horizon_hours is not None
+                and isinstance(horizon, (int, float))
+                and not isinstance(horizon, bool)
+                and _is_finite_number(horizon)
+                and horizon > limits.max_planning_horizon_hours):
+            problems.append(
+                "request exceeds configured max_planning_horizon_hours "
+                f"({limits.max_planning_horizon_hours})"
+            )
+
+    options = request_data.get("options")
+    if (limits is not None
+            and limits.max_solver_seconds_per_stage is not None
+            and (options is None or isinstance(options, dict))):
+        requested_time = (
+            options.get("max_time_seconds")
+            if isinstance(options, dict) else None
+        )
+        max_stage_time = limits.max_solver_seconds_per_stage
+        if (requested_time is not None
+                and isinstance(requested_time, (int, float))
+                and not isinstance(requested_time, bool)
+                and _is_finite_number(requested_time)
+                and requested_time > max_stage_time):
+            problems.append(
+                "options.max_time_seconds exceeds configured "
+                "max_solver_seconds_per_stage "
+                f"({max_stage_time})"
+            )
+        elif requested_time is None:
+            effective_default = min(
+                DEFAULT_PUBLIC_TIME_LIMIT_SECONDS, max_stage_time
+            )
+            if effective_default < DEFAULT_PUBLIC_TIME_LIMIT_SECONDS:
+                limited_request = dict(request_data)
+                limited_options = dict(options or {})
+                limited_options["max_time_seconds"] = effective_default
+                limited_request["options"] = limited_options
+
+    if problems:
+        _log_rejected_request(correlation_id, "ResourceLimitExceeded", len(problems))
+        if strict:
+            raise OptimizerInputError(problems)
+        return _error_result(STATUS_INVALID_INPUT, problems)
+    return optimize(
+        limited_request,
+        objective=objective,
+        strict=strict,
+        correlation_id=correlation_id,
+    )
 
 
 def get_input_schema():

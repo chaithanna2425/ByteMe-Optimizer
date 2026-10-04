@@ -236,6 +236,14 @@ OUTPUT_SCHEMA = {
                 "status": {"type": "string"},
                 "factory_name": {"type": ["string", "null"]},
                 "objective": {"type": ["string", "null"]},
+                "optimization_scope": {
+                    "type": "string",
+                    "enum": [
+                        "FULL_DECLARED_CONSTRAINTS",
+                        "CONDITIONAL_ON_BASELINE_PINNED_STARTS",
+                    ],
+                    "description": "OPTIMAL proves the optimized-stage objective only within this scope. Non-flexible processes are fixed at their baseline start times when scope is CONDITIONAL_ON_BASELINE_PINNED_STARTS.",
+                },
                 "solve_time_seconds": {"type": ["number", "null"]},
                 "baseline": {"$ref": "#/definitions/schedule"},
                 "optimized": {"$ref": "#/definitions/schedule"},

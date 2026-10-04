@@ -10,7 +10,6 @@ Below/at the limit: valid. Above: INVALID INPUT naming the offending
 process - never a mysterious INFEASIBLE.
 """
 
-import copy
 import unittest
 
 from optimizer.models import (

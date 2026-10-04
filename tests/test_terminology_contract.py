@@ -18,7 +18,7 @@ import json
 import re
 import unittest
 
-from optimizer import app, public_api
+from optimizer import public_api
 from optimizer.factory_data import AVAILABLE_FACTORIES
 from optimizer.input_layer import validate_user_input
 from optimizer.public_api import optimize
@@ -38,8 +38,7 @@ SHARED_VOCABULARY = {
     "dependencies", "is_flexible", "machine_id", "capacity_units", "earliest_start",
     "latest_finish",
     # input: machine
-    "machine_name", "capacity", "machine_capacity", "availability", "power_kw",
-    "compatible_processes",
+    "machine_name", "capacity", "machine_capacity", "availability", "compatible_processes",
     # input: energy + options
     "solar_profile", "tariff_profile", "grid_emission_factor", "objective",
     "max_time_seconds", "factory", "energy", "options",
@@ -48,18 +47,17 @@ SHARED_VOCABULARY = {
     "error_category",
     # result payload
     "baseline", "optimized", "comparison", "machine_utilization", "carbon",
-    "validation_errors", "solve_time_seconds",
+    "validation_errors", "solve_time_seconds", "optimization_scope",
     # comparison
     "makespan_baseline_hours", "makespan_optimized_hours", "cost_baseline",
     "cost_optimized", "cost_savings", "cost_saving_percent",
     "solar_utilization_percent", "shifted_processes",
     # schedule
-    "makespan_hours", "processes", "energy",
-    "solver_diagnostics", "best_objective", "best_bound", "optimality_gap",
+    "makespan_hours", "solver_diagnostics", "best_objective", "best_bound", "optimality_gap",
     # energy block
     "total_kwh", "solar_kwh", "grid_kwh",
     # process row
-    "start_time", "end_time", "solar_kwh", "grid_kwh", "energy_cost",
+    "start_time", "end_time", "energy_cost",
     "tariff",
     # machine utilization entries
     "busy_hours", "capacity_unit_hours", "peak_capacity_units",
@@ -206,7 +204,6 @@ class ForbiddenTermsTests(unittest.TestCase):
     def test_public_api_module_translates_internally_only(self):
         # Internal names may exist inside public_api.py only as engine reads
         # that get renamed by _project_*; never as output keys.
-        import inspect
         source = inspect.getsource(public_api)
         self.assertIn('p["solar_energy_kwh"]', source)   # renamed to solar_kwh
         self.assertIn('"solar_kwh"', source)
@@ -416,7 +413,6 @@ class DocsSchemaConsistencyTests(unittest.TestCase):
     def test_agreed_but_absent_terms_are_documented_not_implemented(self):
         # quantity IS modeled (informational); the order-management terms are
         # deliberately absent from the optimizer and must stay absent.
-        import inspect
         from optimizer import optimizer as engine
         engine_source = inspect.getsource(engine).lower()
         for term in ("production_order", "production_target",

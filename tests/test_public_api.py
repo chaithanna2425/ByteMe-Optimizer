@@ -126,6 +126,53 @@ class OptimizeValidInputTests(unittest.TestCase):
             self.assertGreaterEqual(schedule["solve_time_seconds"], 0)
         self.assertGreaterEqual(result["result"]["solve_time_seconds"], 0)
 
+    def test_optimal_status_exposes_baseline_pinning_scope(self):
+        from ortools.sat.python import cp_model
+
+        from optimizer import optimizer as engine
+
+        real_new_solver = engine._new_solver
+        calls = [0]
+
+        class BaselineFeasibleSolver:
+            def __init__(self, max_time_seconds):
+                self.solver = real_new_solver(max_time_seconds)
+
+            def Solve(self, model):
+                status = self.solver.Solve(model)
+                calls[0] += 1
+                if calls[0] == 1 and status == cp_model.OPTIMAL:
+                    return cp_model.FEASIBLE
+                return status
+
+            def __getattr__(self, name):
+                return getattr(self.solver, name)
+
+        with patch("optimizer.optimizer._new_solver",
+                   side_effect=BaselineFeasibleSolver):
+            result = optimize(copy.deepcopy(VALID_WIDGET))
+
+        payload = result["result"]
+        self.assertEqual(result["status"], STATUS_OPTIMAL)
+        self.assertEqual(payload["baseline"]["status"], STATUS_FEASIBLE)
+        self.assertEqual(payload["optimized"]["status"], STATUS_OPTIMAL)
+        self.assertEqual(
+            payload["optimization_scope"],
+            "CONDITIONAL_ON_BASELINE_PINNED_STARTS",
+        )
+
+    def test_all_flexible_processes_search_full_declared_constraints(self):
+        data = copy.deepcopy(VALID_WIDGET)
+        for process in data["factory"]["processes"]:
+            process["is_flexible"] = True
+
+        result = optimize(data)
+
+        self.assertEqual(
+            result["result"]["optimization_scope"],
+            "FULL_DECLARED_CONSTRAINTS",
+        )
+
     def test_all_seven_registered_factories(self):
         for key in AVAILABLE_FACTORIES:
             with self.subTest(factory=key):
@@ -270,6 +317,10 @@ class OptimizeInvalidInputTests(unittest.TestCase):
         self.assertEqual(result["status"], STATUS_INFEASIBLE)
         self.assertEqual(result["error_category"], "INFEASIBLE")
         self.assertIsNone(result["result"]["optimized"])
+        self.assertEqual(
+            result["result"]["optimization_scope"],
+            "CONDITIONAL_ON_BASELINE_PINNED_STARTS",
+        )
         self.assertIsInstance(result["result"]["solve_time_seconds"], (int, float))
         self.assertGreaterEqual(result["result"]["solve_time_seconds"], 0)
         self.assertIsNone(result["errors"])
@@ -313,6 +364,10 @@ class OptimizeInvalidInputTests(unittest.TestCase):
             result = optimize(data)
         self.assertEqual(result["status"], STATUS_UNKNOWN)
         self.assertEqual(result["result"]["solve_time_seconds"], 0.125)
+        self.assertEqual(
+            result["result"]["optimization_scope"],
+            "CONDITIONAL_ON_BASELINE_PINNED_STARTS",
+        )
         self.assertTrue(any("all processes are marked non-flexible" in w
                             for w in result["warnings"]))
         self.assertTrue(any("uniform across the planning horizon" in w
@@ -325,6 +380,10 @@ class OptimizeInvalidInputTests(unittest.TestCase):
             result = optimize(json.dumps(VALID_WIDGET))
 
         self.assertEqual(result["status"], STATUS_UNKNOWN)
+        self.assertEqual(
+            result["result"]["optimization_scope"],
+            "CONDITIONAL_ON_BASELINE_PINNED_STARTS",
+        )
         self.assertEqual(
             result["result"]["factory_name"], "Demo Widget Lab"
         )
@@ -872,7 +931,8 @@ class ContractStabilityTests(unittest.TestCase):
         self.assertIsInstance(result["warnings"], list)
         self.assertEqual(result["api_version"], "2.0")
         payload = result["result"]
-        for key in ("status", "factory_name", "objective", "baseline",
+        for key in ("status", "factory_name", "objective",
+                    "optimization_scope", "baseline",
                     "optimized", "comparison", "machine_utilization",
                     "carbon", "validation_errors"):
             self.assertIn(key, payload)
@@ -903,6 +963,15 @@ class ContractStabilityTests(unittest.TestCase):
             set(output_schema["properties"]["status"]["enum"]),
             {STATUS_OPTIMAL, STATUS_FEASIBLE, STATUS_INFEASIBLE,
              STATUS_UNKNOWN, STATUS_INVALID_INPUT, STATUS_ERROR},
+        )
+        self.assertEqual(
+            set(output_schema["properties"]["result"]["properties"][
+                "optimization_scope"
+            ]["enum"]),
+            {
+                "FULL_DECLARED_CONSTRAINTS",
+                "CONDITIONAL_ON_BASELINE_PINNED_STARTS",
+            },
         )
 
     def test_output_validates_against_json_schema(self):

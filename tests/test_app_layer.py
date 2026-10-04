@@ -25,7 +25,6 @@ from optimizer.optimizer import SolverUnknownError
 from optimizer.visualization import (
     render_energy_comparison,
     render_energy_profile,
-    render_gantt,
     render_gantt_comparison,
 )
 

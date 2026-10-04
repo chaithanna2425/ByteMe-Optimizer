@@ -16,7 +16,7 @@ All data handled is DEMO/SIMULATED data only.
 
 import json
 
-from optimizer.input_layer import InputValidationError, load_user_input
+from optimizer.input_layer import InputValidationError
 from optimizer.models import FactoryConfigError
 from optimizer.optimizer import (
     create_baseline_schedule,
@@ -247,7 +247,9 @@ def machine_utilization(schedule):
         machine = usage.setdefault(machine_id, {
             "busy_hours": 0.0,
             "capacity_unit_hours": 0.0,
-            "capacity": process.get("machine_capacity", 1),
+            "capacity": process.get(
+                "machine_capacity", 1
+            ),
             "events": [],
         })
         machine["busy_hours"] += hours
